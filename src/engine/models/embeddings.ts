@@ -6,6 +6,8 @@ export type CreateEmbeddingModelOptions = {
   endpoint?: string;
   modelCacheDir?: string;
   device?: "auto" | "cpu" | "metal" | "vulkan" | "cuda";
+  /** Explicit local Transformer/llama instance limit; index callers resolve configuration. */
+  embeddingConcurrency?: number;
 };
 
 export const EmbeddingPurpose = {
@@ -55,6 +57,8 @@ export type EmbeddingModelInfo = Readonly<{
   inputKinds: readonly ContentKind[];
   limits: Readonly<{
     maxBatchSize: number;
+    /** Maximum embed() batches the runtime executes at once. */
+    maxConcurrentBatches?: number;
     maxInputTokens?: number;
     maxImageBytes?: number;
   }>;
@@ -62,6 +66,11 @@ export type EmbeddingModelInfo = Readonly<{
 
 export interface EmbeddingModel {
   readonly info: EmbeddingModelInfo;
+
+  /** Prepare local resources before indexing queues any embedding batches. */
+  prepare?(
+    options?: Pick<EmbeddingOptions, "signal" | "onProgress">,
+  ): Promise<void>;
 
   embed(
     contents: readonly Content[],

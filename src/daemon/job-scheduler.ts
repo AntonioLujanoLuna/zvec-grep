@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { redactErrorText } from "../engine/errors.js";
 import type { IndexProgress } from "../engine/types.js";
 import { DaemonError } from "./errors.js";
 import { rootIdentity, type DaemonLogger } from "./logger.js";
@@ -7,6 +8,13 @@ export type JobState =
   "queued" | "running" | "succeeded" | "failed" | "cancelled";
 export type JobReason =
   "watch" | "reconcile" | "background_reconcile" | "manual" | "fresh_query";
+
+export type IndexJobError = {
+  code: string;
+  message: string;
+  context?: string;
+  cause?: string;
+};
 
 export type IndexJobSnapshot = {
   id: string;
@@ -18,7 +26,7 @@ export type IndexJobSnapshot = {
   startedAt?: number;
   finishedAt?: number;
   progress?: IndexProgress;
-  error?: { code: string; message: string };
+  error?: IndexJobError;
 };
 
 export type SubmitIndexJob = {
@@ -44,7 +52,9 @@ export type JobSchedulerOptions = {
 };
 
 type ScheduledJob = IndexJobSnapshot & {
-  run: SubmitIndexJob["run"];
+  // Cleared once the job reaches a terminal state so the closure (which may
+  // capture credentials from the index options) can be garbage collected.
+  run?: SubmitIndexJob["run"];
   abortController: AbortController;
   completion: Promise<IndexJobSnapshot>;
   resolveCompletion: (snapshot: IndexJobSnapshot) => void;
@@ -53,10 +63,15 @@ type ScheduledJob = IndexJobSnapshot & {
   followup?: ScheduledJob;
 };
 
+// How many finished jobs stay queryable via get()/wait() before the oldest
+// ones are evicted. Keeps the jobs Map bounded on long-running daemons.
+const MAX_RETAINED_FINISHED_JOBS = 256;
+
 export class JobScheduler {
   private readonly jobs = new Map<string, ScheduledJob>();
   private readonly activeByRoot = new Map<string, ScheduledJob>();
   private readonly latestByRoot = new Map<string, ScheduledJob>();
+  private readonly finishedJobIds: string[] = [];
   private readonly queue: ScheduledJob[] = [];
   private readonly concurrency: number;
   private readonly maxAttempts: number;
@@ -157,6 +172,36 @@ export class JobScheduler {
     }
   }
 
+  /**
+   * Drop all in-memory bookkeeping for a root: cancels any active job,
+   * removes the last-job record, and evicts the root's finished jobs from
+   * retention. Call when a root is dropped or evicted — without this the
+   * entries outlive the workspace and accumulate without bound on
+   * long-lived daemons. Drain the root first (cancelRoot +
+   * waitForRootIdle) so no job is still running; a running job left behind
+   * finishes into normal retention.
+   */
+  forgetRoot(canonicalRoot: string): void {
+    this.cancelRoot(canonicalRoot);
+    const forgotten = new Set<string>();
+    for (const [jobId, job] of this.jobs) {
+      if (
+        job.canonicalRoot === canonicalRoot &&
+        job.state !== "queued" &&
+        job.state !== "running"
+      ) {
+        forgotten.add(jobId);
+        this.jobs.delete(jobId);
+      }
+    }
+    this.latestByRoot.delete(canonicalRoot);
+    for (let index = this.finishedJobIds.length - 1; index >= 0; index--) {
+      if (forgotten.has(this.finishedJobIds[index])) {
+        this.finishedJobIds.splice(index, 1);
+      }
+    }
+  }
+
   cancelRoot(canonicalRoot: string): boolean {
     const active = this.activeByRoot.get(canonicalRoot);
     if (!active) {
@@ -221,9 +266,24 @@ export class JobScheduler {
   }
 
   private async runJob(job: ScheduledJob): Promise<void> {
+    // Only non-terminal jobs are pumped, and run is only cleared on finish,
+    // so it is always present here.
+    const run = job.run!;
     try {
-      await job.run((progress) => {
+      await run((progress) => {
         job.progress = { ...progress };
+        if (progress.embedding?.stage === "warning") {
+          this.logger?.event("model.warning", {
+            root_id: rootIdentity(job.canonicalRoot),
+            job_id: job.id,
+            attempt: job.attempt,
+            model: progress.embedding.model,
+            message: redactErrorText(
+              progress.embedding.message ?? "Embedding model warning",
+              512,
+            ),
+          });
+        }
         for (const listener of job.progressListeners) {
           try {
             listener({ ...progress });
@@ -303,6 +363,22 @@ export class JobScheduler {
       this.activate(followup);
     }
     job.resolveCompletion(snapshot(job));
+    // Keep the terminal job for late get()/wait() lookups, but stop pinning
+    // the run closure and any progress listeners, then evict old entries so
+    // the jobs Map stays bounded on long-running daemons.
+    job.run = undefined;
+    job.progressListeners.clear();
+    this.retainFinishedJob(job.id);
+  }
+
+  private retainFinishedJob(jobId: string): void {
+    this.finishedJobIds.push(jobId);
+    while (this.finishedJobIds.length > MAX_RETAINED_FINISHED_JOBS) {
+      const oldest = this.finishedJobIds.shift();
+      if (oldest !== undefined) {
+        this.jobs.delete(oldest);
+      }
+    }
   }
 
   private enqueue(input: SubmitIndexJob): ScheduledJob {
@@ -399,11 +475,11 @@ function mergeQueuedJob(current: ScheduledJob, incoming: SubmitIndexJob): void {
 }
 
 function combineRuns(
-  first: SubmitIndexJob["run"],
+  first: SubmitIndexJob["run"] | undefined,
   second: SubmitIndexJob["run"],
 ): SubmitIndexJob["run"] {
   return async (report, signal) => {
-    await first(report, signal);
+    await first?.(report, signal);
     await second(report, signal);
   };
 }
@@ -435,9 +511,12 @@ function isRetryable(error: unknown): boolean {
   );
 }
 
-function errorInfo(error: unknown): { code: string; message: string } {
+function errorInfo(error: unknown): IndexJobError {
+  const context = errorProperty(error, "context", 4_096);
+  const cause = errorCause(error);
+
   if (error instanceof DaemonError) {
-    return { code: error.code, message: redactMessage(error.message) };
+    return jobError(error.code, error.message, context, cause);
   }
   if (
     error &&
@@ -445,27 +524,111 @@ function errorInfo(error: unknown): { code: string; message: string } {
     "code" in error &&
     typeof error.code === "string"
   ) {
-    return {
-      code: error.code,
-      message: redactMessage(
-        error instanceof Error ? error.message : String(error),
-      ),
-    };
-  }
-  return {
-    code: "INDEX_FAILED",
-    message: redactMessage(
+    return jobError(
+      error.code,
       error instanceof Error ? error.message : String(error),
-    ),
+      context,
+      cause,
+    );
+  }
+  return jobError(
+    "INDEX_FAILED",
+    error instanceof Error ? error.message : String(error),
+    context,
+    cause,
+  );
+}
+
+function jobError(
+  code: string,
+  message: string,
+  context: string | undefined,
+  cause: string | undefined,
+): IndexJobError {
+  return {
+    code: safeErrorCode(code) ?? "INDEX_FAILED",
+    message: redactErrorText(message, 512),
+    ...(context ? { context } : {}),
+    ...(cause ? { cause } : {}),
   };
 }
 
-function redactMessage(message: string): string {
-  return message
-    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
-    .replace(
-      /(api[_ -]?key|token|authorization)\s*[:=]\s*\S+/gi,
-      "$1=[redacted]",
-    )
-    .slice(0, 512);
+function errorProperty(
+  error: unknown,
+  property: "context",
+  maxLength: number,
+): string | undefined {
+  if (!error || typeof error !== "object" || !(property in error)) {
+    return undefined;
+  }
+  const value = error[property];
+  return typeof value === "string" && value.trim().length > 0
+    ? redactErrorText(value, maxLength)
+    : undefined;
+}
+
+function errorCause(error: unknown): string | undefined {
+  if (!(error instanceof Error) || error.cause === undefined) {
+    return undefined;
+  }
+  const summaries: string[] = [];
+  const seen = new Set<object>();
+  let cause: unknown = error.cause;
+  for (let depth = 0; cause !== undefined && depth < 3; depth++) {
+    if (cause && typeof cause === "object") {
+      if (seen.has(cause)) {
+        break;
+      }
+      seen.add(cause);
+    }
+    const summary = causeSummary(cause);
+    if (summary && !summaries.includes(summary)) {
+      summaries.push(summary);
+    }
+    cause = nestedCause(cause);
+  }
+  return summaries.length > 0
+    ? redactErrorText(summaries.join("; "), 512)
+    : undefined;
+}
+
+function causeSummary(cause: unknown): string | undefined {
+  const message =
+    cause instanceof Error
+      ? cause.message
+      : typeof cause === "string" ||
+          typeof cause === "number" ||
+          typeof cause === "boolean"
+        ? String(cause)
+        : cause &&
+            typeof cause === "object" &&
+            "message" in cause &&
+            typeof cause.message === "string"
+          ? cause.message
+          : undefined;
+  const code = errorCodeProperty(cause);
+  if (!message || message.trim().length === 0) {
+    return code;
+  }
+  return code && !message.includes(code) ? `${code}: ${message}` : message;
+}
+
+function nestedCause(error: unknown): unknown {
+  return error && typeof error === "object" && "cause" in error
+    ? error.cause
+    : undefined;
+}
+
+function errorCodeProperty(error: unknown): string | undefined {
+  return error &&
+    typeof error === "object" &&
+    "code" in error &&
+    typeof error.code === "string"
+    ? safeErrorCode(error.code)
+    : undefined;
+}
+
+function safeErrorCode(code: string): string | undefined {
+  const value = redactErrorText(code.trim(), 128);
+  return /^[A-Z][A-Z0-9_.-]{0,127}$/.test(value) ? value : undefined;
 }

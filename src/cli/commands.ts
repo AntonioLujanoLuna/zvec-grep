@@ -12,6 +12,11 @@ import {
   type ZvecGrepInfoResult,
 } from "../index.js";
 import { globalConfigPath, updateGlobalConfig } from "../engine/config.js";
+import {
+  ENGINE_ERROR_CODE_PREFIX,
+  EngineError,
+  type EngineErrorCode,
+} from "../engine/errors.js";
 import { listEmbeddingModels } from "../engine/models/index.js";
 import { DaemonClient } from "../client/daemon-client.js";
 import {
@@ -32,6 +37,7 @@ import {
 } from "./format/context.js";
 import { printDebug } from "./format/debug.js";
 import { createIndexProgressReporter } from "./format/progress.js";
+import { formatContextLines } from "./errors.js";
 import {
   printWorkspaceInfo,
   printIndexPathFilterTip,
@@ -71,6 +77,8 @@ import {
   withRemoteEmbeddingOperationPermit,
 } from "./auth.js";
 
+const DEFAULT_IMPLICIT_EMBEDDING = "local/potion-code-16m-v2";
+
 export async function runParsedCommand(parsed: ParsedArgs): Promise<void> {
   switch (parsed.command) {
     case "query":
@@ -106,7 +114,7 @@ export async function runParsedCommand(parsed: ParsedArgs): Promise<void> {
 async function runConfig(parsed: ParsedArgs): Promise<void> {
   if (parsed.positionals.length !== 1) {
     throw new Error(
-      `zg config ${parsed.options.configAction === "provider-set" ? "provider" : "model"} set requires exactly one reference`,
+      `zg --config ${parsed.options.configAction === "provider-set" ? "provider" : "model"} set requires exactly one reference`,
     );
   }
   const reference = parsed.positionals[0]!;
@@ -124,7 +132,7 @@ async function runConfig(parsed: ParsedArgs): Promise<void> {
       throw unsupportedRemoteEmbeddingProvider(reference);
     }
     if (parsed.options.apiKey === undefined) {
-      throw new Error("zg config provider set requires --api-key");
+      throw new Error("zg --config provider set requires --api-key");
     }
     updateGlobalConfig({
       providers: {
@@ -139,7 +147,7 @@ async function runConfig(parsed: ParsedArgs): Promise<void> {
   }
 
   if (parsed.options.configAction !== "model-set") {
-    throw new Error("zg config requires provider set or model set");
+    throw new Error("zg --config requires provider set or model set");
   }
   const catalogEntry = requireEmbeddingModelCatalogEntry(reference);
   if (
@@ -148,7 +156,7 @@ async function runConfig(parsed: ParsedArgs): Promise<void> {
     !parsed.options.defaultModel
   ) {
     throw new Error(
-      "zg config model set requires --endpoint, --device, or --default",
+      "zg --config model set requires --endpoint, --device, or --default",
     );
   }
   if (
@@ -207,7 +215,7 @@ async function runIndex(parsed: ParsedArgs): Promise<void> {
   const root = resolveIndexRoot(parsed.positionals[0]);
   const rootPath = indexRootPath(root, parsed.options);
   if (parsed.positionals.length > 1) {
-    throw new Error("zg index accepts at most one root path");
+    throw new Error("zg --index accepts at most one root path");
   }
 
   if (parsed.options.drop) {
@@ -275,7 +283,7 @@ async function runIndex(parsed: ParsedArgs): Promise<void> {
         );
       }
       if (result.state === "failed") {
-        throw new Error(serverIndexFailureMessage(result));
+        throw serverIndexFailure(result);
       }
       if (result.state === "succeeded") {
         const status = (await client
@@ -293,7 +301,45 @@ async function runIndex(parsed: ParsedArgs): Promise<void> {
   });
 }
 
+function serverIndexFailure(result: Record<string, unknown>): Error {
+  const error = result.error;
+  if (error && typeof error === "object") {
+    const fields = error as Record<string, unknown>;
+    const code = nonEmptyString(fields.code);
+    if (code?.startsWith(`${ENGINE_ERROR_CODE_PREFIX}.`)) {
+      const message =
+        nonEmptyString(fields.message) ?? "Index job failed unexpectedly.";
+      return new EngineError(stripErrorCode(message, code), {
+        code: code as EngineErrorCode,
+        context: nonEmptyString(fields.context),
+        cause: nonEmptyString(fields.cause),
+      });
+    }
+  }
+  const cause =
+    error && typeof error === "object" && "cause" in error
+      ? nonEmptyString(error.cause)
+      : undefined;
+  return new Error(serverIndexFailureMessage(result), { cause });
+}
+
 function serverIndexFailureMessage(result: Record<string, unknown>): string {
+  const error = result.error;
+  const context =
+    error && typeof error === "object" && "context" in error
+      ? error.context
+      : undefined;
+  const details =
+    typeof context === "string" ? formatContextLines(context) : [];
+  return [
+    serverIndexFailureSummary(result),
+    ...(details.length > 0
+      ? ["Details:", ...details.map((line) => `  ${line}`)]
+      : []),
+  ].join("\n");
+}
+
+function serverIndexFailureSummary(result: Record<string, unknown>): string {
   const error = result.error;
   if (error && typeof error === "object") {
     const code = (error as Record<string, unknown>).code;
@@ -312,7 +358,20 @@ function serverIndexFailureMessage(result: Record<string, unknown>): string {
       return `[${code}] Index job failed.`;
     }
   }
-  return `Index job ${String(result.job_id ?? "unknown")} failed. Run zg status --mode server for details.`;
+  return `Index job ${String(result.job_id ?? "unknown")} failed. Run zg --status --mode server for details.`;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0
+    ? value
+    : undefined;
+}
+
+function stripErrorCode(message: string, code: string): string {
+  const prefix = `[${code}]`;
+  return message.startsWith(prefix)
+    ? message.slice(prefix.length).trimStart()
+    : message;
 }
 
 async function runDirectIndex(
@@ -447,7 +506,7 @@ async function confirmIndexDrop(
   }
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error(
-      "zg index --drop requires --yes in a non-interactive shell",
+      "zg --index --drop requires --yes in a non-interactive shell",
     );
   }
 
@@ -468,7 +527,7 @@ async function confirmIndexDrop(
 async function runServer(parsed: ParsedArgs): Promise<void> {
   if (parsed.positionals.length > 0) {
     throw new Error(
-      `zg server ${parsed.options.serverStdio ? "--stdio" : parsed.options.serverAction} does not accept positional arguments`,
+      `zg --server ${parsed.options.serverStdio ? "--stdio" : parsed.options.serverAction} does not accept positional arguments`,
     );
   }
   const { readPackageVersion } = await import("./version.js");
@@ -530,7 +589,7 @@ async function runServer(parsed: ParsedArgs): Promise<void> {
 async function runStatus(parsed: ParsedArgs): Promise<void> {
   const root = parsed.positionals[0] ?? process.cwd();
   if (parsed.positionals.length > 1) {
-    throw new Error("zg status accepts at most one root path");
+    throw new Error("zg --status accepts at most one root path");
   }
 
   const mode = resolveClientMode(parsed.options.mode);
@@ -587,8 +646,8 @@ async function runQuery(parsed: ParsedArgs): Promise<void> {
   ) {
     throw new Error(
       parsed.options.rg
-        ? "zg query --rg requires a pattern. Use zg help query for examples."
-        : "zg query requires text or --hybrid/--fts/--vector routes. Use zg help query for examples.",
+        ? "zg --rg requires a pattern. Use zg --help search for examples."
+        : "zg requires text or --hybrid/--fts/--vector routes. Use zg --help search for examples.",
     );
   }
   if (commandOptions.rg) {
@@ -600,7 +659,10 @@ async function runQuery(parsed: ParsedArgs): Promise<void> {
     await routeByMode({
       mode,
       serverAvailable: () => daemonIsReady(commandOptions.home),
-      server: () => runServerQuery(commandOptions, queries, routes),
+      server: async () => {
+        await ensureServerIndex(commandOptions);
+        await runServerQuery(commandOptions, queries, routes);
+      },
       direct: () => runDirectQuery(commandOptions, queries),
     });
     return;
@@ -653,7 +715,15 @@ async function runDirectQuery(
         if (progressEvent.phase !== "done") progress.report(progressEvent);
       },
     );
-    const info = await directQueryInfo(zvecGrep);
+    let info = await directQueryInfo(zvecGrep);
+    if (!info.indexed && info.indexPolicy !== "disabled") {
+      await buildImplicitDirectIndex(
+        commandOptions,
+        info.root,
+        progress.report,
+      );
+      info = await directQueryInfo(zvecGrep);
+    }
     const schema = info.workspaceIndex?.embedding;
     const workspaceRuntime = workspaceRuntimeFromInfo(info);
     const modelInfo =
@@ -713,6 +783,68 @@ async function runDirectQuery(
   }
 }
 
+async function buildImplicitDirectIndex(
+  options: CliOptions,
+  root: string,
+  onProgress: (progress: IndexProgress) => void,
+): Promise<void> {
+  const embedding = implicitEmbeddingReference(options);
+  console.error(`No index found; creating one with ${embedding}.`);
+  const service = await createZvecGrep(
+    createServiceOptions({ ...options, embedding }, root),
+  );
+  try {
+    await service.index({
+      root,
+      onProgress,
+      embeddingConcurrency: options.embeddingConcurrency,
+    });
+  } finally {
+    await service.close();
+  }
+}
+
+async function ensureServerIndex(options: CliOptions): Promise<void> {
+  const root = resolve(process.cwd());
+  const client = daemonClient(options);
+  const status = await client.callTool("zvec_grep_index_status", { root });
+  if (status.indexed === true || status.index_policy === "disabled") return;
+
+  const embedding = implicitEmbeddingReference(options);
+  console.error(`No index found; creating one with ${embedding}.`);
+  const progress = createIndexProgressReporter({ color: options.color });
+  let result: Record<string, unknown>;
+  try {
+    result = await client.callTool(
+      "zvec_grep_index",
+      {
+        root,
+        embedding,
+        device: options.device,
+        embeddingConcurrency: options.embeddingConcurrency,
+        wait: true,
+      },
+      {
+        onProgress: (event) => {
+          const update = indexProgressFromMessage(event.message);
+          if (update) progress.report(update.progress);
+        },
+        embeddingEnvironment: embedding,
+      },
+    );
+  } finally {
+    progress.finish();
+  }
+  if (result.state === "failed") throw serverIndexFailure(result);
+}
+
+function implicitEmbeddingReference(options: CliOptions): string {
+  const configured = configuredEmbeddingReference(options, undefined);
+  return configured?.startsWith("local/")
+    ? configured
+    : DEFAULT_IMPLICIT_EMBEDDING;
+}
+
 async function runServerQuery(
   options: CliOptions,
   queries: readonly string[],
@@ -742,7 +874,6 @@ async function runServerQuery(
       maxDepth: options.maxDepth,
       maxFileSizeBytes: options.maxFileSizeBytes,
       follow: options.follow,
-      embeddingConcurrency: options.embeddingConcurrency,
       modifiedAfter: options.modifiedAfter,
       modifiedBefore: options.modifiedBefore,
       freshness: searchPolicy.freshness,
@@ -875,7 +1006,6 @@ function contextOptions(
     modifiedAfter: options.modifiedAfter,
     modifiedBefore: options.modifiedBefore,
     symbolTypes: options.symbolTypes,
-    embeddingConcurrency: options.embeddingConcurrency,
   };
 }
 

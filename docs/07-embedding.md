@@ -7,17 +7,27 @@
 
 The Embedding model determines the vector representation used by indexed
 search. It affects language coverage, memory use, index size, input length, and
-indexing speed. A new index needs an explicit model, an environment default, or
-a configured default:
+indexing speed. A new index selects an explicit model, an environment default,
+or a configured default, and otherwise uses the built-in local default:
 
 ```bash
-zg index --embedding local/potion-code-16m-v2
+zg --index --embedding local/potion-code-16m-v2
 ```
 
 Local models keep workspace content and query text on the machine. Their files
-are downloaded on first use and cached under `~/.zvec-grep/models` by default.
+are downloaded from Hugging Face on first use and cached under
+`~/.zvec-grep/models` by default. If a pinned Hugging Face artifact cannot be
+downloaded, zvec-grep automatically falls back to its pinned, integrity-checked
+ModelScope copy. A complete ModelScope snapshot is reused on later runs without
+retrying Hugging Face. ModelScope downloads use a separate `modelscope` cache
+subdirectory.
+
 Remote models avoid local inference but send disclosed query or workspace
 content to the configured provider after authorization.
+
+A first search without an index always creates one with a local model. It
+respects a configured local default but does not implicitly use a remote
+default. Select and authorize a remote model explicitly with `zg --index`.
 
 ## Quick selection
 
@@ -69,8 +79,8 @@ release.
 Set a default for new indexes:
 
 ```bash
-zg config model set local/potion-code-16m-v2 --default
-zg index
+zg --config model set local/potion-code-16m-v2 --default
+zg --index
 ```
 
 `ZVEC_GREP_EMBEDDING` provides a process-level default that takes priority over
@@ -78,11 +88,11 @@ the configured global default for new indexes:
 
 ```bash
 export ZVEC_GREP_EMBEDDING=local/potion-code-16m-v2
-zg index
+zg --index
 ```
 
 An existing index always reuses its stored provider, model, dimensions, and
-metric unless `--embedding` and `--rebuild` explicitly change them. `zg index`
+metric unless `--embedding` and `--rebuild` explicitly change them. `zg --index`
 forwards the current CLI environment default in server and auto modes; direct
 MCP calls use the environment inherited by the daemon.
 
@@ -91,7 +101,7 @@ MCP calls use the environment inherited by the daemon.
 Select a device for local Transformer and GGUF models:
 
 ```bash
-zg index \
+zg --index \
   --embedding local/jina-embeddings-v2-base-code \
   --device auto
 ```
@@ -100,17 +110,31 @@ Supported values are `auto`, `cpu`, `metal`, `vulkan`, and `cuda`. Save a model
 preference globally with:
 
 ```bash
-zg config model set local/jina-embeddings-v2-base-code --device metal
+zg --config model set local/jina-embeddings-v2-base-code --device metal
 ```
 
 The equivalent environment override is `ZVEC_GREP_DEVICE`. Model2Vec models
 such as Potion use static vector lookup, so selecting a GPU does not improve
 their runtime.
 
+For ONNX models using Transformers.js, `auto` uses the runtime's Node default
+(CPU). Select a GPU device explicitly when its hardware and runtime libraries
+are available. GGUF models retain their own automatic device selection.
+
+If Transformers.js cannot initialize a model, indexing stops instead of
+retrying the same load for every file. Correct the model or device configuration
+and restart the process or daemon before retrying; a failed first ONNX session
+can leave the runtime unusable for the rest of the process. For a GPU
+initialization error, restart and use `--device cpu` (or configure
+`ZVEC_GREP_DEVICE=cpu` in the daemon environment when no saved device overrides
+it). GPU inference failures after a successful initialization can still fall
+back to CPU. Model warnings are retained in the daemon log as `model.warning`
+events as well as sent through live progress.
+
 Override the download cache with `--model-cache` or `ZVEC_GREP_MODEL_CACHE`:
 
 ```bash
-zg index \
+zg --index \
   --embedding local/potion-code-16m-v2 \
   --model-cache /path/to/model-cache
 ```
@@ -120,15 +144,15 @@ zg index \
 Configure the Qwen provider credential and, optionally, a model endpoint:
 
 ```bash
-zg config provider set qwen --api-key "$DASHSCOPE_API_KEY"
-zg config model set qwen/text-embedding-v4 --default
+zg --config provider set qwen --api-key "$DASHSCOPE_API_KEY"
+zg --config model set qwen/text-embedding-v4 --default
 ```
 
 One-off values can be passed directly or through `ZVEC_GREP_API_KEY` and
 `ZVEC_GREP_ENDPOINT`:
 
 ```bash
-zg index \
+zg --index \
   --embedding qwen/text-embedding-v4 \
   --api-key "$DASHSCOPE_API_KEY" \
   --allow-remote
@@ -139,13 +163,13 @@ transfer. `--allow-remote` authorizes Remote Embedding only for the current
 command. To create a signed Workspace grant shared by the CLI and MCP server:
 
 ```bash
-zg auth grant \
+zg --auth grant \
   --capability embedding \
   --scope workspace \
   --embedding qwen/text-embedding-v4
 
-zg auth status
-zg auth revoke
+zg --auth status
+zg --auth revoke
 ```
 
 Before granting access, confirm that the workspace content is permitted to be
@@ -154,7 +178,7 @@ this data authorization.
 
 When Qoder CLI reports that it has no handler for `elicitation/create`, or
 declines or cancels without displaying the form, the `AGENTS.md` guidance
-installed by `zg install --target qoder` uses the exact `AskUserQuestion` tool
+installed by `zg --install --target qoder` uses the exact `AskUserQuestion` tool
 as a compatibility path. It offers workspace approval, local FTS only, or
 cancel.
 
@@ -183,7 +207,7 @@ records the count.
 Inspect the index after changing models or file scope:
 
 ```bash
-zg status
+zg --status
 ```
 
 Prefer a model with a larger input limit or narrow the indexed content when
@@ -195,7 +219,7 @@ Vector spaces from different models are incompatible, even when their
 dimensions match. Rebuild explicitly when changing models:
 
 ```bash
-zg index --rebuild --embedding local/jina-embeddings-v2-base-code
+zg --index --rebuild --embedding local/jina-embeddings-v2-base-code
 ```
 
 Changing a remote endpoint also requires a rebuild because the endpoint is part

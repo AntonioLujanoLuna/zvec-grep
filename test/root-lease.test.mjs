@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import {
   access,
   mkdir,
@@ -8,6 +9,7 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { hostname } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +18,7 @@ import { RootLeaseManager } from "../dist/daemon/root-lease.js";
 import {
   assertDaemonWriteAllowed,
   daemonLeasePath,
+  readDaemonLease,
 } from "../dist/engine/utils/daemon-lease.js";
 import { createZvecGrep } from "../dist/index.js";
 import { printError } from "../dist/cli/errors.js";
@@ -158,3 +161,128 @@ test("a Direct write permit prevents daemon activation until the write completes
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
 });
+
+test("lease heartbeats never expose a truncated record", async (t) => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-lease-heartbeat-"),
+  );
+  const root = join(temporaryDirectory, "repo");
+  await mkdir(root);
+  const callbacks = [];
+  t.mock.method(globalThis, "setInterval", (callback) => {
+    callbacks.push(callback);
+    return { unref() {} };
+  });
+  const manager = new RootLeaseManager();
+  const lease = await manager.acquire(root);
+  const originalWriteFile = fs.writeFile;
+  let observedRecord;
+  let permitError;
+  const heartbeatWritten = Promise.withResolvers();
+  try {
+    fs.writeFile = async (path, data, options) => {
+      const handle = await fs.open(path, options?.flag ?? "w", options?.mode);
+      try {
+        observedRecord = readDaemonLease(root);
+        try {
+          assertDaemonWriteAllowed(root, manager.instanceToken);
+        } catch (error) {
+          permitError = error;
+        }
+        await handle.writeFile(data);
+      } finally {
+        await handle.close();
+        heartbeatWritten.resolve();
+      }
+    };
+    syncBuiltinESMExports();
+    assert.equal(callbacks.length, 1);
+    callbacks[0]();
+    await heartbeatWritten.promise;
+    await manager.close();
+
+    assert.equal(permitError, undefined);
+    assert.equal(observedRecord?.instanceToken, manager.instanceToken);
+  } finally {
+    fs.writeFile = originalWriteFile;
+    syncBuiltinESMExports();
+    await lease.release();
+    await manager.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+for (const action of ["release", "close"]) {
+  test(`lease ${action} waits for a slow heartbeat across subsequent ticks`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "zvec-grep-lease-overlap-"));
+    let heartbeat;
+    t.mock.method(globalThis, "setInterval", (callback) => {
+      heartbeat = callback;
+      return { unref() {} };
+    });
+    const manager = new RootLeaseManager();
+    const lease = await manager.acquire(root);
+    const originalRename = fs.rename;
+    const renameEntered = Promise.withResolvers();
+    const resumeRename = Promise.withResolvers();
+    const renameFinished = Promise.withResolvers();
+    let cleanup;
+    try {
+      fs.rename = async (...args) => {
+        renameEntered.resolve();
+        await resumeRename.promise;
+        try {
+          return await originalRename(...args);
+        } finally {
+          renameFinished.resolve();
+        }
+      };
+      syncBuiltinESMExports();
+      heartbeat();
+      await renameEntered.promise;
+      heartbeat();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      // Exhaust cleanup retries immediately if it fails to wait for the heartbeat.
+      t.mock.method(globalThis, "setTimeout", (callback) => {
+        queueMicrotask(callback);
+      });
+      let settled = false;
+      let cleanupError;
+      cleanup = (action === "release" ? lease.release() : manager.close()).then(
+        () => {
+          settled = true;
+        },
+        (error) => {
+          settled = true;
+          cleanupError = error;
+        },
+      );
+      heartbeat();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(
+        settled,
+        false,
+        "cleanup must wait for the pending heartbeat",
+      );
+      assert.equal(readDaemonLease(root)?.instanceToken, manager.instanceToken);
+
+      resumeRename.resolve();
+      await cleanup;
+      assert.equal(cleanupError, undefined);
+      await assert.rejects(access(daemonLeasePath(root)), { code: "ENOENT" });
+      const permit = assertDaemonWriteAllowed(root);
+      assert.ok(permit);
+      permit.release();
+    } finally {
+      resumeRename.resolve();
+      await renameFinished.promise;
+      await cleanup;
+      fs.rename = originalRename;
+      syncBuiltinESMExports();
+      await lease.release();
+      await manager.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}

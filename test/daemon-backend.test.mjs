@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { DaemonBackend } from "../dist/daemon/backend.js";
 import { inspectRoot } from "../dist/daemon/runtime-manager.js";
+import { WatchManager } from "../dist/daemon/watch-manager.js";
 import { BaseEmbeddingModel } from "../dist/engine/models/embeddings.js";
 import { createZvecGrep } from "../dist/index.js";
 
@@ -13,6 +15,61 @@ const noopWatchManagerFactory = () => ({
   start() {},
   flushPending: async () => {},
   close: async () => {},
+});
+
+test("daemon reports watcher active only after watch registration", async () => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-watcher-active-"),
+  );
+  const root = join(temporaryDirectory, "repo");
+  await mkdir(root);
+  await writeFile(join(root, "answer.ts"), "export const answer = 42;\n");
+  const service = await createZvecGrep({
+    root,
+    embeddingModel: new TestEmbeddingModel(),
+  });
+  await service.index();
+  await service.close();
+  let watcherOptions;
+  const backend = new DaemonBackend({
+    version: "1.0.0",
+    modelPoolOptions: { createModel: () => new TestEmbeddingModel() },
+    createService: (options) =>
+      createZvecGrep({
+        ...options,
+        embeddingModel: new TestEmbeddingModel(),
+      }),
+    watchManagerFactory: (options) => {
+      watcherOptions = options;
+      return {
+        start() {},
+        flushPending: async () => {},
+        close: async () => {},
+      };
+    },
+  });
+  try {
+    await backend.search(searchInput(root, "answer", "eventual"));
+    assert.equal(
+      (await backend.indexStatus({ root })).runtime.watcherActive,
+      false,
+    );
+
+    watcherOptions.onActiveChange(true);
+    assert.equal(
+      (await backend.indexStatus({ root })).runtime.watcherActive,
+      true,
+    );
+
+    watcherOptions.onActiveChange(false);
+    assert.equal(
+      (await backend.indexStatus({ root })).runtime.watcherActive,
+      false,
+    );
+  } finally {
+    await backend.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
 });
 
 test("index releases its model lease when service creation fails", async () => {
@@ -39,6 +96,77 @@ test("index releases its model lease when service creation fails", async () => {
     });
     assert.equal(result.state, "failed");
     assert.equal(backend.modelPool.snapshot().activeLeases, 0);
+  } finally {
+    await backend.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("index preserves Qwen model creation diagnostics when the API key is missing", async () => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-backend-qwen-missing-key-"),
+  );
+  const root = join(temporaryDirectory, "repo");
+  await mkdir(root);
+  const backend = new DaemonBackend({
+    version: "1.0.0",
+    serviceOptions: { apiKey: "" },
+    watchManagerFactory: noopWatchManagerFactory,
+  });
+
+  try {
+    const result = await backend.index({
+      root,
+      embedding: "qwen/text-embedding-v4",
+      wait: true,
+    });
+
+    assert.equal(result.state, "failed");
+    assert.equal(
+      result.error.code,
+      "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_MISSING_API_KEY",
+    );
+    assert.equal(
+      result.error.message,
+      "Qwen text-embedding-v4 model requires an API key",
+    );
+    assert.match(result.error.context, /model=qwen\/text-embedding-v4/);
+    assert.match(result.error.context, /hint=Pass --api-key/);
+  } finally {
+    await backend.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("index wraps unstructured model creation failures", async () => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-backend-model-create-failure-"),
+  );
+  const root = join(temporaryDirectory, "repo");
+  await mkdir(root);
+  const backend = new DaemonBackend({
+    version: "1.0.0",
+    modelPoolOptions: {
+      createModel: () => {
+        throw new Error("fixture model creation failure");
+      },
+    },
+    watchManagerFactory: noopWatchManagerFactory,
+  });
+
+  try {
+    const result = await backend.index({
+      root,
+      embedding: "test/deterministic",
+      wait: true,
+    });
+
+    assert.equal(result.state, "failed");
+    assert.deepEqual(result.error, {
+      code: "MODEL_LOAD_FAILED",
+      message:
+        "[MODEL_LOAD_FAILED] Embedding model test/deterministic could not be created: fixture model creation failure",
+    });
   } finally {
     await backend.close();
     await rm(temporaryDirectory, { recursive: true, force: true });
@@ -197,6 +325,8 @@ test("drop index cancels an active backend index job before dropping", async () 
   });
   let indexSignal;
   let dropCalled = false;
+  let jobAtDropTime;
+  let indexJobId;
   const backend = new DaemonBackend({
     version: "1.0.0",
     watchManagerFactory: noopWatchManagerFactory,
@@ -219,6 +349,7 @@ test("drop index cancels an active backend index job before dropping", async () 
       },
       dropIndex: async () => {
         dropCalled = true;
+        jobAtDropTime = backend.scheduler.get(indexJobId);
         return true;
       },
       close: async () => {},
@@ -230,16 +361,20 @@ test("drop index cancels an active backend index job before dropping", async () 
       embedding: "test/deterministic",
       wait: false,
     });
+    indexJobId = index.jobId;
     await indexStarted;
 
     const drop = await backend.dropIndex({ root });
-    const job = backend.scheduler.get(index.jobId);
 
     assert.equal(indexSignal.aborted, true);
-    assert.equal(job.state, "cancelled");
-    assert.equal(job.error.code, "INDEX_CANCELLED");
+    // The active job was already terminal when the drop itself ran.
+    assert.equal(jobAtDropTime?.state, "cancelled");
+    assert.equal(jobAtDropTime?.error.code, "INDEX_CANCELLED");
     assert.equal(dropCalled, true);
     assert.deepEqual(drop, { root: await realpath(root), removed: true });
+    // Dropping the root also releases its scheduler bookkeeping.
+    assert.equal(backend.scheduler.get(index.jobId), undefined);
+    assert.equal(backend.scheduler.getByRoot(await realpath(root)), undefined);
   } finally {
     await backend.close();
     await rm(temporaryDirectory, { recursive: true, force: true });
@@ -1780,7 +1915,9 @@ test("watch changes use the path-level index pipeline and advance revisions", as
     watchManagerFactory: (options) => {
       watcherOptions = options;
       return {
-        start() {},
+        start() {
+          options.onActiveChange(true);
+        },
         flushPending: async () => {},
         close: async () => {
           watcherCloses += 1;
@@ -1814,6 +1951,54 @@ test("watch changes use the path-level index pipeline and advance revisions", as
     assert.equal(status.runtime.watcherActive, true);
     assert.equal(status.runtime.dirtyRevision, 2);
     assert.equal(status.runtime.indexedRevision, 2);
+    await waitFor(() => watcherCloses === 1);
+    assert.equal((await backend.serverStatus()).activeRuntimes, 0);
+  } finally {
+    await backend.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("scheduled watcher reconciliation does not prevent idle eviction", async () => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-watch-idle-reconcile-"),
+  );
+  const root = join(temporaryDirectory, "repo");
+  await mkdir(root);
+  await writeFile(join(root, "answer.ts"), "export const answer = 42;\n");
+  const service = await createZvecGrep({
+    root,
+    embeddingModel: new TestEmbeddingModel(),
+  });
+  await service.index();
+  await service.close();
+  let watcherCloses = 0;
+  const backend = new DaemonBackend({
+    version: "1.0.0",
+    modelPoolOptions: { createModel: () => new TestEmbeddingModel() },
+    runtimeIdleTtlMs: 100,
+    watchManagerFactory: (options) =>
+      new WatchManager({
+        ...options,
+        debounceMs: 1,
+        maxWaitMs: 5,
+        reconcileIntervalMs: 20,
+        resumeCheckIntervalMs: 0,
+        watchFactory: () => {
+          const watcher = new EventEmitter();
+          watcher.close = () => {
+            watcherCloses += 1;
+          };
+          return watcher;
+        },
+      }),
+  });
+  try {
+    await backend.search({
+      ...searchInput(root, "answer", "eventual"),
+      autoUpdate: false,
+    });
+    assert.equal((await backend.serverStatus()).activeRuntimes, 1);
     await waitFor(() => watcherCloses === 1);
     assert.equal((await backend.serverStatus()).activeRuntimes, 0);
   } finally {

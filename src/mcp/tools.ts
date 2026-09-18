@@ -72,6 +72,13 @@ import {
 export type IndexJobState =
   "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
+export type ZvecGrepIndexError = {
+  code: string;
+  message: string;
+  context?: string;
+  cause?: string;
+};
+
 export type ZvecGrepIndexResult = {
   root: string;
   jobId: string;
@@ -79,7 +86,7 @@ export type ZvecGrepIndexResult = {
   reused: boolean;
   action?: "index" | "drop";
   dropped?: boolean;
-  error?: { code: string; message: string };
+  error?: ZvecGrepIndexError;
   scanDiagnostics?: FileScanDiagnostics;
 };
 
@@ -165,7 +172,7 @@ export type ZvecGrepIndexStatusResult = {
       completed: number;
       total: number;
     };
-    error?: { code: string; message: string };
+    error?: ZvecGrepIndexError;
   };
 };
 
@@ -405,6 +412,12 @@ export function registerZvecGrepTools(
                   ? [
                       `error_code: ${result.error.code}`,
                       `error_message: ${result.error.message}`,
+                      ...(result.error.context
+                        ? [`error_context: ${result.error.context}`]
+                        : []),
+                      ...(result.error.cause
+                        ? [`error_cause: ${result.error.cause}`]
+                        : []),
                     ]
                   : []),
                 ...(result.scanDiagnostics

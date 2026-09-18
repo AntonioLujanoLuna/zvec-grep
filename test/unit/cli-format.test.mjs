@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
-import { printError } from "../../dist/cli/errors.js";
+import {
+  modelDownloadFailureMessage,
+  printError,
+} from "../../dist/cli/errors.js";
 import {
   contextWarningLines,
   formatAgentContextResult,
@@ -101,6 +104,142 @@ function workspaceIndex(overrides = {}) {
     ...overrides,
   };
 }
+
+function failedServerIndexInfo(error) {
+  return {
+    root: "/failed-repo",
+    indexed: false,
+    index_policy: "undecided",
+    source: "unindexed",
+    persistent: {
+      home: "/failed-repo/.zvec-grep",
+      index_path: "/failed-repo/.zvec-grep/index.zvec",
+    },
+    runtime: { job_state: "failed", error },
+  };
+}
+
+test("server status displays non-download job error context as readable details", async () => {
+  const error = {
+    code: "ZVEC_GREP.ENGINE.INDEXING.FILES_FAILED",
+    message: "Indexing completed with 1 failed file",
+  };
+  const info = failedServerIndexInfo(error);
+  const withoutContext = await captureConsole(() =>
+    printServerIndexInfo(info, { color: "never" }),
+  );
+  assert.doesNotMatch(withoutContext.logs.join("\n"), /Details/);
+  assert.deepEqual(withoutContext.logs.slice(-2), [
+    `  Error       ${error.code}`,
+    `              ${error.message}`,
+  ]);
+
+  error.context =
+    "failedReasons=fail.ts: PARSE_FAILED: Unable to parse file\n" +
+    "file=fail.ts stage=parsing";
+  const withContext = await captureConsole(() =>
+    printServerIndexInfo(info, { color: "never" }),
+  );
+  assert.deepEqual(withContext.logs, [
+    ...withoutContext.logs,
+    "  Details     failedReasons: fail.ts: PARSE_FAILED: Unable to parse file",
+    "              file: fail.ts",
+    "              stage: parsing",
+  ]);
+});
+
+test("server status summarizes model download failures unless debug details are requested", async () => {
+  const downloadCode = "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED";
+  const error = {
+    code: "ZVEC_GREP.ENGINE.INDEXING.FILES_FAILED",
+    message: "Indexing completed with 1 failed file",
+    context:
+      `failedReasons=README.md: embed: ${downloadCode}: Unable to download Model2vec model artifact (model=local/potion-code-16m-v2 url=https://huggingface.co/model/model.safetensors)\n` +
+      "filesFailed=1",
+    cause: "fetch failed: HTTP 503 Service Unavailable",
+  };
+  const info = failedServerIndexInfo(error);
+  const normal = await captureConsole(() =>
+    printServerIndexInfo(info, { color: "never" }),
+  );
+  assert.equal(
+    normal.logs.at(-1),
+    '  Error       Failed to download model "local/potion-code-16m-v2".',
+  );
+  assert.doesNotMatch(
+    normal.logs.join("\n"),
+    /FILES_FAILED|MODEL2VEC_DOWNLOAD_FAILED|Details|Cause|huggingface|failedReasons|HTTP 503/,
+  );
+
+  const debug = await captureConsole(() =>
+    printServerIndexInfo(info, { color: "never", debug: true }),
+  );
+  const debugText = debug.logs.join("\n");
+  assert.match(
+    debugText,
+    /Failed to download model "local\/potion-code-16m-v2"\./,
+  );
+  assert.match(debugText, /ZVEC_GREP\.ENGINE\.INDEXING\.FILES_FAILED/);
+  assert.match(debugText, /Details\s+failedReasons:/);
+  assert.match(debugText, /MODEL2VEC_DOWNLOAD_FAILED/);
+  assert.match(
+    debugText,
+    /https:\/\/huggingface\.co\/model\/model\.safetensors/,
+  );
+  assert.match(debugText, /Cause\s+fetch failed: HTTP 503/);
+});
+
+test("direct workspace status summarizes stored model download failures unless debug details are requested", async () => {
+  const downloadCode = "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED";
+  const info = {
+    root: "/repo",
+    indexed: true,
+    indexPolicy: "enabled",
+    source: "index",
+    home: "/repo/.zvec-grep",
+    indexPath: "/repo/.zvec-grep/index.zvec",
+    workspaceIndex: workspaceIndex(),
+    status: status({
+      filesPending: 0,
+      failedFiles: [
+        {
+          relativePath: "README.md",
+          indexStatus: {
+            indexedTime: null,
+            entityCount: 0,
+            error: `embed: ${downloadCode}: Unable to download Model2vec model artifact (model=local/potion-code-16m-v2 url=https://huggingface.co/model/config.json) Authorization: Bearer direct-status-secret`,
+          },
+        },
+      ],
+    }),
+  };
+  const normal = await captureConsole(() =>
+    printWorkspaceInfo(info, { color: "never" }),
+  );
+  assert.ok(
+    normal.logs.includes(
+      '  Error       Failed to download model "local/potion-code-16m-v2".',
+    ),
+  );
+  assert.doesNotMatch(
+    normal.logs.join("\n"),
+    /MODEL2VEC_DOWNLOAD_FAILED|Details|huggingface|Unable to download/,
+  );
+
+  const debug = await captureConsole(() =>
+    printWorkspaceInfo(info, { color: "never", debug: true }),
+  );
+  const debugText = debug.logs.join("\n");
+  assert.match(
+    debugText,
+    /Error\s+Failed to download model "local\/potion-code-16m-v2"\./,
+  );
+  assert.match(debugText, /Details\s+README\.md: embed:/);
+  assert.match(debugText, /MODEL2VEC_DOWNLOAD_FAILED/);
+  assert.match(debugText, /https:\/\/huggingface\.co\/model\/config\.json/);
+  assert.match(debugText, /Authorization: \[redacted\]/);
+  assert.doesNotMatch(debugText, /direct-status-secret/);
+});
 
 function contextResult(overrides = {}) {
   const lines = Array.from(
@@ -816,7 +955,7 @@ test("status formatters cover workspace states, failures, filters, and color", a
         indexPath: "/repo/.zvec-grep/index.zvec",
         workspaceIndex: info,
         status: stale,
-        suggestion: "zg index",
+        suggestion: "zg --index",
       },
       { color: "never" },
     );
@@ -895,7 +1034,7 @@ test("status formatters cover workspace states, failures, filters, and color", a
             entities: 7,
             truncated_fragments: 4,
           },
-          suggestion: "zg index",
+          suggestion: "zg --index",
         },
         runtime: {
           job_state: "running",
@@ -918,12 +1057,15 @@ test("status formatters cover workspace states, failures, filters, and color", a
         runtime: {
           job_state: "failed",
           error: {
-            code: "MODEL_LOAD_FAILED",
-            message: "Embedding schema could not be resolved.",
+            code: "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED",
+            message: "Unable to download Model2Vec model artifact",
+            context:
+              "model=local/potion-code-16m-v2 status=503\nrepo=minishlab/potion-code-16M-v2",
+            cause: "fetch failed",
           },
         },
       },
-      { color: "never" },
+      { color: "never", debug: true },
     );
   });
   assert.match(output.logs.join("\n"), /Problem\s+fail\.ts/);
@@ -931,18 +1073,24 @@ test("status formatters cover workspace states, failures, filters, and color", a
   assert.match(output.logs.join("\n"), /1m 5s/);
   assert.match(output.logs.join("\n"), /ignore-file=\.rgignore/);
   assert.match(output.logs.join("\n"), /Default indexing skips/);
-  assert.match(output.logs.join("\n"), /zg help file-types/);
+  assert.match(output.logs.join("\n"), /zg --help file-types/);
   assert.match(
     output.logs.join("\n"),
     new RegExp(
       `◐ Workspace index is updating[\\s\\S]*Coverage\\s+${progressBar(15, 5)}\\s+75%\\s+3 / 4 files`,
     ),
   );
-  assert.match(output.logs.join("\n"), /Error\s+MODEL_LOAD_FAILED/);
   assert.match(
     output.logs.join("\n"),
-    /Embedding schema could not be resolved/,
+    /ZVEC_GREP\.ENGINE\.MODELS\.MODEL2VEC_DOWNLOAD_FAILED/,
   );
+  assert.match(
+    output.logs.join("\n"),
+    /Error\s+Failed to download model "local\/potion-code-16m-v2"\./,
+  );
+  assert.match(output.logs.join("\n"), /Details\s+model:/);
+  assert.match(output.logs.join("\n"), /status: 503/);
+  assert.match(output.logs.join("\n"), /Cause\s+fetch failed/);
 
   for (const stateInfo of [
     {
@@ -991,7 +1139,7 @@ test("status formatters cover workspace states, failures, filters, and color", a
       indexPath: "/repo/.zvec-grep/index.zvec",
       workspaceIndex: stateInfo.workspaceIndex,
       status: stateInfo.status,
-      suggestion: "zg index",
+      suggestion: "zg --index",
     };
     const rendered = await captureConsole(() =>
       printWorkspaceInfo(workspace, { color: "never" }),
@@ -1348,7 +1496,7 @@ test("Remote Embedding authorization status uses grouped colors and compact path
     "  /repo",
     "",
     "Run",
-    "  zg auth grant --capability embedding --scope workspace",
+    "  zg --auth grant --capability embedding --scope workspace",
   ]);
 });
 
@@ -1374,6 +1522,137 @@ test("error formatter renders engine context, causes, plain values, and color", 
   assert.match(text, /string cause/);
   assert.match(text, /plain value/);
   assert.match(text, /\x1b\[/);
+});
+
+test("model download summary recognizes direct and aggregated download errors", () => {
+  const downloadCode = "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED";
+  const expected = 'Failed to download model "local/potion-code-16m-v2".';
+  const direct = new EngineError(
+    "Unable to download Model2vec model artifact",
+    {
+      code: downloadCode,
+      context:
+        "model=local/potion-code-16m-v2\nurl=https://huggingface.co/model/config.json",
+    },
+  );
+  const aggregated = {
+    code: "ZVEC_GREP.ENGINE.INDEXING.FILES_FAILED",
+    message: "Indexing completed with 1 failed file",
+    context:
+      `failedReasons=README.md: embed: ${downloadCode}: Unable to download Model2vec model artifact (model=local/potion-code-16m-v2 url=https://huggingface.co/model/config.json)\n` +
+      "hint=Retried failed files once automatically",
+  };
+  assert.equal(modelDownloadFailureMessage(direct), expected);
+  assert.equal(modelDownloadFailureMessage(aggregated), expected);
+  assert.equal(
+    modelDownloadFailureMessage({
+      code: downloadCode,
+      context: "model=local/potion-code-16m-v2",
+    }),
+    expected,
+  );
+  assert.equal(
+    modelDownloadFailureMessage({ code: downloadCode }),
+    "Failed to download model.",
+  );
+  assert.equal(
+    modelDownloadFailureMessage({
+      code: aggregated.code,
+      context: `failedReasons=README.md: embed: ${downloadCode}: Download failed`,
+    }),
+    "Failed to download model.",
+  );
+});
+
+test("model download summary does not mistake unrelated errors or fields for download failures", () => {
+  const downloadCode = "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED";
+  const filesFailedCode = "ZVEC_GREP.ENGINE.INDEXING.FILES_FAILED";
+  const unrelatedErrors = [
+    undefined,
+    null,
+    downloadCode,
+    new Error(downloadCode),
+    {
+      code: `${downloadCode}_RETRY`,
+      context: "model=local/potion-code-16m-v2",
+    },
+    {
+      code: "ZVEC_GREP.ENGINE.TEST.FAILURE",
+      context: `failedReasons=${downloadCode}: model=local/potion-code-16m-v2`,
+    },
+    {
+      code: filesFailedCode,
+      message: downloadCode,
+      context: "model=local/potion-code-16m-v2",
+    },
+    {
+      code: filesFailedCode,
+      context: `hint=${downloadCode}\nmodel=local/potion-code-16m-v2`,
+    },
+    {
+      code: filesFailedCode,
+      context:
+        `failedFiles=${downloadCode}.ts\n` +
+        "failedReasons=README.md: PARSE_FAILED: Unable to parse file",
+    },
+  ];
+  for (const error of unrelatedErrors) {
+    assert.equal(modelDownloadFailureMessage(error), undefined);
+  }
+});
+
+test("error formatter keeps direct and aggregated model download failures to one line by default", async () => {
+  const downloadCode = "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED";
+  const downloadContext =
+    "model=local/potion-code-16m-v2 url=https://huggingface.co/model/config.json token=model-download-secret";
+  const cases = [
+    new EngineError("Unable to download Model2vec model artifact", {
+      code: downloadCode,
+      context: downloadContext,
+      cause: new Error(
+        "HTTP 503 Service Unavailable token=model-download-secret",
+      ),
+    }),
+    new EngineError("Indexing completed with 1 failed file", {
+      code: "ZVEC_GREP.ENGINE.INDEXING.FILES_FAILED",
+      context: `failedReasons=README.md: embed: ${downloadCode}: Unable to download Model2vec model artifact (${downloadContext})`,
+    }),
+  ];
+  for (const error of cases) {
+    const normal = await captureConsole(() =>
+      printError(error, { color: "never" }),
+    );
+    assert.deepEqual(normal.errors, [
+      'Error: Failed to download model "local/potion-code-16m-v2".',
+    ]);
+
+    const debug = await captureConsole(() =>
+      printError(error, { color: "never", debug: true }),
+    );
+    assert.equal(debug.errors[0], normal.errors[0]);
+    assert.ok(debug.errors.includes(`Code: ${error.code}`));
+    assert.ok(debug.errors.includes("Details:"));
+    assert.match(debug.errors.join("\n"), /https:\/\/huggingface\.co/);
+    assert.match(debug.errors.join("\n"), /\[redacted\]/);
+    assert.doesNotMatch(debug.errors.join("\n"), /model-download-secret/);
+    if (error.cause) {
+      assert.ok(
+        debug.errors.includes(
+          "Cause: HTTP 503 Service Unavailable token=[redacted]",
+        ),
+      );
+    }
+  }
+
+  const unknownModel = await captureConsole(() =>
+    printError(
+      new EngineError("Unable to download Model2vec model artifact", {
+        code: downloadCode,
+      }),
+      { color: "never" },
+    ),
+  );
+  assert.deepEqual(unknownModel.errors, ["Error: Failed to download model."]);
 });
 
 test("progress reporter covers TTY and non-TTY phases, counters, truncation, and idempotent finish", () => {

@@ -14,7 +14,11 @@ import {
   resolveServerSearchPolicy,
 } from "../dist/client/search-policy.js";
 import { DaemonClient } from "../dist/client/daemon-client.js";
-import { parseListenAddress } from "../dist/daemon/config.js";
+import {
+  DEFAULT_WATCHER_IDLE_TIMEOUT_MS,
+  configuredWatcherIdleTimeoutMs,
+  parseListenAddress,
+} from "../dist/daemon/config.js";
 import { DaemonHttpServer } from "../dist/daemon/http-server.js";
 import { readInstanceRecord } from "../dist/daemon/server-controller.js";
 
@@ -25,7 +29,7 @@ const packageVersion = JSON.parse(
 ).version;
 
 test("server run parses a loopback listen address", () => {
-  const parsed = parseArgs(["server", "run", "--listen", "127.0.0.1:8123"]);
+  const parsed = parseArgs(["--server", "run", "--listen", "127.0.0.1:8123"]);
   assert.equal(parsed.command, "server");
   assert.equal(parsed.options.serverAction, "run");
   assert.equal(parsed.options.listen, "127.0.0.1:8123");
@@ -35,46 +39,66 @@ test("server run parses a loopback listen address", () => {
   });
 });
 
+test("watcher idle timeout uses a four-hour default and accepts seconds from the environment", () => {
+  assert.equal(configuredWatcherIdleTimeoutMs({}), 4 * 60 * 60_000);
+  assert.equal(
+    configuredWatcherIdleTimeoutMs({
+      ZVEC_GREP_WATCHER_IDLE_TIMEOUT_SECONDS: "90",
+    }),
+    90_000,
+  );
+  assert.equal(
+    configuredWatcherIdleTimeoutMs({
+      ZVEC_GREP_WATCHER_IDLE_TIMEOUT_SECONDS: "0",
+    }),
+    0,
+  );
+  assert.equal(DEFAULT_WATCHER_IDLE_TIMEOUT_MS, 4 * 60 * 60_000);
+  for (const value of ["-1", "1.5", "forever", "2147484"]) {
+    assert.throws(
+      () =>
+        configuredWatcherIdleTimeoutMs({
+          ZVEC_GREP_WATCHER_IDLE_TIMEOUT_SECONDS: value,
+        }),
+      /must be an integer between 0 and 2147483/,
+    );
+  }
+});
+
 test("server lifecycle and client mode arguments are parsed", () => {
-  assert.equal(parseArgs(["server", "--stdio"]).options.serverStdio, true);
+  assert.equal(parseArgs(["--server", "--stdio"]).options.serverStdio, true);
   assert.throws(
-    () => parseArgs(["server", "on", "--stdio"]),
+    () => parseArgs(["--server", "on", "--stdio"]),
     /cannot be combined/i,
   );
   for (const action of ["on", "off", "status"]) {
-    const parsed = parseArgs(["server", action]);
+    const parsed = parseArgs(["--server", action]);
     assert.equal(parsed.options.serverAction, action);
   }
   assert.equal(
-    parseArgs(["server", "on", "--mcp-toolset", "full"]).options.mcpToolset,
+    parseArgs(["--server", "on", "--mcp-toolset", "full"]).options.mcpToolset,
     "full",
   );
   assert.equal(
-    parseArgs(["server", "run", "--mcp-toolset=agent"]).options.mcpToolset,
+    parseArgs(["--server", "run", "--mcp-toolset=agent"]).options.mcpToolset,
     "agent",
   );
   assert.throws(
-    () => parseArgs(["server", "on", "--mcp-toolset", "all"]),
+    () => parseArgs(["--server", "on", "--mcp-toolset", "all"]),
     /agent.*full/i,
   );
   assert.throws(
-    () => parseArgs(["server", "off", "--mcp-toolset", "full"]),
-    /only be used with zg server on or run/i,
+    () => parseArgs(["--server", "off", "--mcp-toolset", "full"]),
+    /only be used with zg --server on or run/i,
   );
-  assert.equal(
-    parseArgs(["query", "--mode", "server", "query"]).options.mode,
-    "server",
-  );
-  assert.equal(
-    parseArgs(["query", "--mode=auto", "query"]).options.mode,
-    "auto",
-  );
+  assert.equal(parseArgs(["--mode", "server", "query"]).options.mode, "server");
+  assert.equal(parseArgs(["--mode=auto", "query"]).options.mode, "auto");
   assert.throws(
-    () => parseArgs(["query", "--mode", "invalid", "query"]),
+    () => parseArgs(["--mode", "invalid", "query"]),
     /direct, server, or auto/i,
   );
   assert.throws(
-    () => parseArgs(["query", "--force-direct", "query"]),
+    () => parseArgs(["--force-direct", "query"]),
     /requires --mode direct/i,
   );
 });
@@ -85,7 +109,7 @@ test("stdio bootstrap starts and reuses the shared daemon", async (t) => {
   t.after(async () => {
     await execFileAsync(process.execPath, [
       cliPath,
-      "server",
+      "--server",
       "off",
       "--home",
       home,
@@ -98,7 +122,7 @@ test("stdio bootstrap starts and reuses the shared daemon", async (t) => {
     command: process.execPath,
     args: [
       cliPath,
-      "server",
+      "--server",
       "--stdio",
       "--home",
       home,
@@ -132,23 +156,17 @@ test("server queries map refresh modes to search policy", () => {
     autoUpdate: false,
   });
   assert.equal(
-    parseArgs(["query", "--refresh", "background", "query"]).options.refresh,
+    parseArgs(["--refresh", "background", "query"]).options.refresh,
     "background",
   );
-  assert.equal(
-    parseArgs(["query", "--refresh=wait", "query"]).options.refresh,
-    "wait",
-  );
+  assert.equal(parseArgs(["--refresh=wait", "query"]).options.refresh, "wait");
   assert.throws(
-    () => parseArgs(["query", "--refresh", "invalid", "query"]),
+    () => parseArgs(["--refresh", "invalid", "query"]),
     /background, wait, or off/i,
   );
+  assert.throws(() => parseArgs(["--fresh", "query"]), /Unknown option/);
   assert.throws(
-    () => parseArgs(["query", "--fresh", "query"]),
-    /Unknown option/,
-  );
-  assert.throws(
-    () => parseArgs(["query", "--no-auto-update", "query"]),
+    () => parseArgs(["--no-auto-update", "query"]),
     /Unknown option/,
   );
 });
@@ -182,8 +200,8 @@ test("server run rejects non-loopback addresses and unrelated listen flags", () 
     /loopback/i,
   );
   assert.throws(
-    () => parseArgs(["query", "--listen", "127.0.0.1:7999", "query"]),
-    /zg server on or run/i,
+    () => parseArgs(["--listen", "127.0.0.1:7999", "query"]),
+    /zg --server on or run/i,
   );
 });
 
@@ -194,7 +212,7 @@ test("server on, status and off are idempotent", async (t) => {
   t.after(async () => {
     await execFileAsync(process.execPath, [
       cliPath,
-      "server",
+      "--server",
       "off",
       ...args,
     ]).catch(() => undefined);
@@ -203,7 +221,7 @@ test("server on, status and off are idempotent", async (t) => {
 
   const first = await execFileAsync(process.execPath, [
     cliPath,
-    "server",
+    "--server",
     "on",
     "--listen",
     `127.0.0.1:${port}`,
@@ -213,14 +231,14 @@ test("server on, status and off are idempotent", async (t) => {
   assert.equal((await readInstanceRecord(home)).mcpToolset, "agent");
   const second = await execFileAsync(process.execPath, [
     cliPath,
-    "server",
+    "--server",
     "on",
     ...args,
   ]);
   assert.match(second.stdout, /Server: ready/);
   const status = await execFileAsync(process.execPath, [
     cliPath,
-    "server",
+    "--server",
     "status",
     "--check-ready",
     ...args,
@@ -250,14 +268,14 @@ test("server on, status and off are idempotent", async (t) => {
   });
   const stopped = await execFileAsync(process.execPath, [
     cliPath,
-    "server",
+    "--server",
     "off",
     ...args,
   ]);
   assert.match(stopped.stdout, /Server: stopped/);
   const stoppedAgain = await execFileAsync(process.execPath, [
     cliPath,
-    "server",
+    "--server",
     "off",
     ...args,
   ]);
@@ -272,7 +290,7 @@ test("server toolset flag overrides the environment and the environment is a fal
   t.after(async () => {
     await execFileAsync(
       process.execPath,
-      [cliPath, "server", "off", "--home", home],
+      [cliPath, "--server", "off", "--home", home],
       { env },
     ).catch(() => undefined);
     await rm(home, { recursive: true, force: true });
@@ -280,31 +298,31 @@ test("server toolset flag overrides the environment and the environment is a fal
 
   await execFileAsync(
     process.execPath,
-    [cliPath, "server", "on", "--mcp-toolset", "agent", ...commonArgs],
+    [cliPath, "--server", "on", "--mcp-toolset", "agent", ...commonArgs],
     { env },
   );
   assert.equal((await readInstanceRecord(home)).mcpToolset, "agent");
   const agentStatus = await execFileAsync(
     process.execPath,
-    [cliPath, "server", "status", "--home", home],
+    [cliPath, "--server", "status", "--home", home],
     { env },
   );
   assert.match(agentStatus.stdout, /MCP toolset: agent/);
 
   await execFileAsync(
     process.execPath,
-    [cliPath, "server", "off", "--home", home],
+    [cliPath, "--server", "off", "--home", home],
     { env },
   );
   await execFileAsync(
     process.execPath,
-    [cliPath, "server", "on", ...commonArgs],
+    [cliPath, "--server", "on", ...commonArgs],
     { env },
   );
   assert.equal((await readInstanceRecord(home)).mcpToolset, "full");
   const fullStatus = await execFileAsync(
     process.execPath,
-    [cliPath, "server", "status", "--home", home],
+    [cliPath, "--server", "status", "--home", home],
     { env },
   );
   assert.match(fullStatus.stdout, /MCP toolset: full/);
@@ -319,7 +337,7 @@ test("server token file enables authentication", async (t) => {
   t.after(async () => {
     await execFileAsync(process.execPath, [
       cliPath,
-      "server",
+      "--server",
       "off",
       "--home",
       home,
@@ -331,7 +349,7 @@ test("server token file enables authentication", async (t) => {
 
   await execFileAsync(process.execPath, [
     cliPath,
-    "server",
+    "--server",
     "on",
     "--listen",
     `127.0.0.1:${port}`,
@@ -352,7 +370,7 @@ test("server token file enables authentication", async (t) => {
   assert.equal(clientStatus.version, packageVersion);
   const stopped = await execFileAsync(process.execPath, [
     cliPath,
-    "server",
+    "--server",
     "off",
     "--home",
     home,
@@ -378,7 +396,7 @@ test(
       [
         "--liftoff-only",
         cliPath,
-        "server",
+        "--server",
         "run",
         "--listen",
         `127.0.0.1:${port}`,

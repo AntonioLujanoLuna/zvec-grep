@@ -310,8 +310,10 @@ const jobStateSchema = z.enum([
   "cancelled",
 ]);
 const jobErrorSchema = z.object({
-  code: z.string(),
+  code: z.string().regex(/^[A-Z][A-Z0-9_.-]{0,127}$/),
   message: z.string(),
+  context: z.string().max(4_096).optional(),
+  cause: z.string().max(512).optional(),
 });
 const rangeSchema = z.union([
   z.object({ kind: z.literal("file") }),

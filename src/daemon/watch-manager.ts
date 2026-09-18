@@ -17,10 +17,11 @@ export type WatchManagerOptions = {
   maxChangedPaths?: number;
   watchFactory?: typeof watch;
   onPendingChange?: (pending: boolean) => void;
+  onActivity?: () => void;
+  onActiveChange?: (active: boolean) => void;
   resumeCheckIntervalMs?: number;
   resumeThresholdMs?: number;
   platform?: NodeJS.Platform;
-  nodeVersion?: string;
   getRootPaths?: () => readonly RootPath[] | undefined;
 };
 
@@ -49,11 +50,16 @@ export class WatchManager {
   private reconcileTimer?: ReturnType<typeof setInterval>;
   private resumeTimer?: ReturnType<typeof setInterval>;
   private closed = false;
+  private active = false;
+  private useDirectoryWatchers: boolean;
   private reconcileRequested = false;
   private lastResumeCheckAt = Date.now();
 
   constructor(private readonly options: WatchManagerOptions) {
     this.changes = this.newChangeSet();
+    this.useDirectoryWatchers = requiresDirectoryWatchers(
+      options.platform ?? process.platform,
+    );
   }
 
   start(): void {
@@ -90,6 +96,7 @@ export class WatchManager {
     this.watchers.clear();
     this.watchedDirectories.clear();
     this.directoryWatchers.clear();
+    this.setActive(false);
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.maxWaitTimer) clearTimeout(this.maxWaitTimer);
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
@@ -111,7 +118,22 @@ export class WatchManager {
   }
 
   async refreshPaths(): Promise<void> {
-    if (this.closed || this.directoryWatchers.size === 0) {
+    if (this.closed) {
+      return;
+    }
+    if (this.directoryWatchers.size === 0) {
+      if (this.useDirectoryWatchers) {
+        await this.watchDirectoryTree(
+          this.options.root,
+          this.options.watchFactory ?? watch,
+        );
+        if (this.directoryWatchers.size > 0) {
+          // Changes can land after the index's final status scan but before
+          // the initial directory tree is fully watched. Reconcile once after
+          // closing that activation gap; later path refreshes stay incremental.
+          this.queueFullReconcile();
+        }
+      }
       return;
     }
     await this.refreshDirectoryTree(
@@ -148,7 +170,9 @@ export class WatchManager {
     if (!info && eventType === "rename") {
       this.removeDirectoryWatchers(path);
     }
-    if (!(await this.shouldTrackPath(path, info?.isDirectory() === true))) {
+    if (
+      !(await this.shouldTrackPath(path, info?.isDirectory() === true, "track"))
+    ) {
       return;
     }
     if (this.closed) {
@@ -157,6 +181,7 @@ export class WatchManager {
     if (info?.isDirectory() && eventType === "rename") {
       void this.watchDirectoryTree(path, factory);
     }
+    this.options.onActivity?.();
     this.changes.add(
       path,
       info ? (eventType === "rename" ? "created" : "changed") : "deleted",
@@ -252,6 +277,9 @@ export class WatchManager {
     const recoveryKey = directory ?? PRIMARY_WATCHER;
     this.watchers.add(watcher);
     if (directory) this.directoryWatchers.set(directory, watcher);
+    if (!directory || directory === this.options.root) {
+      this.setActive(true);
+    }
     watcher.on("error", () => {
       watcher.close();
       this.watchers.delete(watcher);
@@ -259,30 +287,10 @@ export class WatchManager {
         this.directoryWatchers.delete(directory);
         this.watchedDirectories.delete(directory);
       }
-      const recovery = this.recoveryState(recoveryKey);
-      if (recovery.stableTimer) clearTimeout(recovery.stableTimer);
-      recovery.stableTimer = undefined;
-      recovery.consecutiveErrors += 1;
-      if (!recovery.reconciliationPending) {
-        recovery.reconciliationPending = true;
-        this.queueFullReconcile();
+      if (!directory || directory === this.options.root) {
+        this.setActive(false);
       }
-      if (!this.closed) {
-        if (recovery.retryTimer) clearTimeout(recovery.retryTimer);
-        const retryDelayMs = Math.min(
-          100 * 2 ** (recovery.consecutiveErrors - 1),
-          5_000,
-        );
-        recovery.retryTimer = setTimeout(() => {
-          recovery.retryTimer = undefined;
-          if (directory) {
-            void this.watchDirectoryTree(directory, factory);
-          } else {
-            this.startPrimaryWatcher(factory);
-          }
-        }, retryDelayMs);
-        recovery.retryTimer.unref?.();
-      }
+      this.recoverWatcher(recoveryKey, directory, factory);
     });
     const recovery = this.recoveryState(recoveryKey);
     if (recovery.stableTimer) clearTimeout(recovery.stableTimer);
@@ -308,17 +316,65 @@ export class WatchManager {
     return created;
   }
 
-  private startPrimaryWatcher(factory: typeof watch): void {
+  private recoverWatcher(
+    recoveryKey: string | typeof PRIMARY_WATCHER,
+    directory: string | undefined,
+    factory: typeof watch,
+  ): void {
+    const recovery = this.recoveryState(recoveryKey);
+    if (recovery.stableTimer) clearTimeout(recovery.stableTimer);
+    recovery.stableTimer = undefined;
+    recovery.consecutiveErrors += 1;
+    if (!recovery.reconciliationPending) {
+      recovery.reconciliationPending = true;
+      this.queueFullReconcile();
+    }
     if (this.closed) {
       return;
     }
-    if (
-      requiresDirectoryWatchers(
-        this.options.platform ?? process.platform,
-        this.options.nodeVersion ?? process.versions.node,
-      )
-    ) {
-      void this.watchDirectoryTree(this.options.root, factory);
+    if (recovery.retryTimer) clearTimeout(recovery.retryTimer);
+    const retryDelayMs = Math.min(
+      100 * 2 ** (recovery.consecutiveErrors - 1),
+      5_000,
+    );
+    recovery.retryTimer = setTimeout(() => {
+      recovery.retryTimer = undefined;
+      if (directory) {
+        void this.restoreDirectoryWatcher(directory, factory);
+      } else {
+        this.startPrimaryWatcher(factory, true);
+      }
+    }, retryDelayMs);
+    recovery.retryTimer.unref?.();
+  }
+
+  private async restoreDirectoryWatcher(
+    directory: string,
+    factory: typeof watch,
+  ): Promise<void> {
+    await this.watchDirectoryTree(directory, factory);
+    if (!this.closed && this.directoryWatchers.has(directory)) {
+      this.queueFullReconcile();
+    }
+  }
+
+  private setActive(active: boolean): void {
+    if (this.active === active) {
+      return;
+    }
+    this.active = active;
+    this.options.onActiveChange?.(active);
+  }
+
+  private startPrimaryWatcher(
+    factory: typeof watch,
+    reconcileAfterRegistration = false,
+  ): void {
+    if (this.closed) {
+      return;
+    }
+    if (this.useDirectoryWatchers) {
+      void this.startDirectoryWatchers(factory, reconcileAfterRegistration);
       return;
     }
     try {
@@ -327,7 +383,9 @@ export class WatchManager {
           this.options.root,
           { recursive: true },
           (eventType, filename) => {
-            if (!filename || this.closed) {
+            if (this.closed) return;
+            if (!filename) {
+              this.options.onActivity?.();
               this.queueFullReconcile();
               return;
             }
@@ -340,8 +398,26 @@ export class WatchManager {
         ),
         factory,
       );
+      if (reconcileAfterRegistration) {
+        this.queueFullReconcile();
+      }
     } catch {
-      void this.watchDirectoryTree(this.options.root, factory);
+      this.useDirectoryWatchers = true;
+      void this.startDirectoryWatchers(factory, true);
+    }
+  }
+
+  private async startDirectoryWatchers(
+    factory: typeof watch,
+    reconcileAfterRegistration: boolean,
+  ): Promise<void> {
+    await this.watchDirectoryTree(this.options.root, factory);
+    if (
+      !this.closed &&
+      reconcileAfterRegistration &&
+      this.directoryWatchers.has(this.options.root)
+    ) {
+      this.queueFullReconcile();
     }
   }
 
@@ -356,7 +432,10 @@ export class WatchManager {
     ) {
       return;
     }
-    if (!(await this.shouldTrackPath(directory, true))) {
+    if (
+      !(await this.shouldTrackPath(directory, true, "defer")) ||
+      this.closed
+    ) {
       return;
     }
     if (!this.watchedDirectories.has(directory)) {
@@ -364,7 +443,9 @@ export class WatchManager {
       try {
         this.addWatcher(
           factory(directory, { recursive: false }, (eventType, filename) => {
-            if (!filename || this.closed) {
+            if (this.closed) return;
+            if (!filename) {
+              this.options.onActivity?.();
               this.queueFullReconcile();
               return;
             }
@@ -377,9 +458,13 @@ export class WatchManager {
           factory,
           directory,
         );
-      } catch {
+      } catch (error) {
         this.watchedDirectories.delete(directory);
-        this.queueFullReconcile();
+        if (isMissingWatchTarget(error)) {
+          this.queueFullReconcile();
+          return;
+        }
+        this.recoverWatcher(directory, directory, factory);
         return;
       }
     }
@@ -398,15 +483,19 @@ export class WatchManager {
   private async shouldTrackPath(
     path: string,
     isDirectory: boolean,
+    whenRootPathsUnavailable: "track" | "defer",
   ): Promise<boolean> {
     if (basename(path) === ".gitignore") {
       return true;
     }
     try {
-      const rootPaths = this.options.getRootPaths?.();
+      if (!this.options.getRootPaths) {
+        return true;
+      }
+      const rootPaths = this.options.getRootPaths();
       return rootPaths
         ? await pathCanAffectIndex(rootPaths, path, isDirectory)
-        : true;
+        : whenRootPathsUnavailable === "track";
     } catch {
       // Filtering must fail open so an unreadable rule file cannot hide a
       // change that the indexer still needs to reconcile.
@@ -439,18 +528,25 @@ export class WatchManager {
         this.watchers.delete(watcher);
         this.directoryWatchers.delete(directory);
         this.watchedDirectories.delete(directory);
+        if (directory === this.options.root) {
+          this.setActive(false);
+        }
       }
     }
   }
 }
 
-function requiresDirectoryWatchers(
-  platform: NodeJS.Platform,
-  nodeVersion: string,
-): boolean {
-  if (platform !== "linux") {
+// Linux always uses per-directory watchers. Node's recursive watcher is not
+// native on Linux: it walks the whole tree and registers an inotify watch for
+// every file and directory, ignoring index exclusions, which exhausts the
+// per-user fs.inotify.max_user_watches quota for the whole machine.
+function requiresDirectoryWatchers(platform: NodeJS.Platform): boolean {
+  return platform === "linux";
+}
+
+function isMissingWatchTarget(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
     return false;
   }
-  const [major, minor] = nodeVersion.split(".", 2).map(Number);
-  return major === 22 && minor === 0;
+  return error.code === "ENOENT" || error.code === "ENOTDIR";
 }

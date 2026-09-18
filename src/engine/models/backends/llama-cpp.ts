@@ -1,13 +1,12 @@
 import {
   closeSync,
   existsSync,
-  mkdirSync,
   openSync,
   readSync,
   statSync,
   unlinkSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { join, resolve } from "node:path";
 import { EngineError } from "../../errors.js";
 import type { Content, TextContent } from "../../types.js";
 import { defaultHome } from "../../utils/path.js";
@@ -19,7 +18,17 @@ import {
   type EmbeddingResult,
   type NormalizedEmbeddingOptions,
 } from "../embeddings.js";
+import {
+  resolveModelArtifacts,
+  type ModelArtifactSource,
+} from "../artifact-downloader.js";
 import type { LlamaCppEmbeddingCatalogEntry } from "../catalog.js";
+import {
+  INDEX_EMBEDDING_CONCURRENCY_ENV,
+  normalizeLocalEmbeddingConcurrency,
+  resolveLocalEmbeddingParallelism,
+} from "../local-embedding-parallelism.js";
+import { LocalEmbeddingQueue } from "../local-embedding-queue.js";
 import {
   createModelDownloadProgressReporter,
   type ModelDownloadProgressReporter,
@@ -61,33 +70,23 @@ type LlamaGpuSelection =
 
 type NodeLlamaCppModule = {
   getLlama(options: Record<string, unknown>): Promise<Llama>;
-  resolveModelFile(
-    model: string,
-    options: {
-      directory: string;
-      cli?: boolean;
-      onProgress?: (status: {
-        totalSize: number;
-        downloadedSize: number;
-      }) => void;
-    },
-  ): Promise<string>;
   LlamaLogLevel?: { error?: unknown };
 };
 
 type NodeLlamaCppLoader = () => Promise<NodeLlamaCppModule>;
+type ModelArtifactResolver = typeof resolveModelArtifacts;
 type LlamaCppRuntimeState = {
   failedGpuInitModes: Set<LlamaGpuSelection>;
   cpuCompatibleFallbackWarningShown: boolean;
 };
 type LlamaCppDependencies = {
   loadRuntime: NodeLlamaCppLoader;
+  resolveArtifacts: ModelArtifactResolver;
   runtimeState: LlamaCppRuntimeState;
 };
 
 const DEFAULT_MODEL_CACHE_DIR = join(defaultHome(), "models");
 const GGUF_MAGIC = Buffer.from("GGUF");
-const DEFAULT_PARALLELISM_CAP = 8;
 const DEFAULT_DARWIN_CMAKE_OPTIONS = {
   GGML_OPENMP: "OFF",
 } as const;
@@ -134,6 +133,7 @@ const defaultDependencies: LlamaCppDependencies = {
     defaultRuntimeImport ??= defaultNodeLlamaCppLoader();
     return defaultRuntimeImport;
   },
+  resolveArtifacts: resolveModelArtifacts,
   runtimeState: {
     failedGpuInitModes: new Set<LlamaGpuSelection>(),
     cpuCompatibleFallbackWarningShown: false,
@@ -147,14 +147,20 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
   private readonly gpu: LlamaGpuSelection;
   private readonly parallelism?: number;
   private readonly dependencies: LlamaCppDependencies;
+  // Each batch uses the context pool internally. Serialize batches so a context
+  // is never shared by two zg requests, including during CPU fallback.
+  private readonly embeddingQueue = new LocalEmbeddingQueue(async () => 1);
 
   private runtimeImport: Promise<NodeLlamaCppModule> | null = null;
   private llama: Llama | null = null;
   private model: LlamaModel | null = null;
   private contexts: LlamaEmbeddingContext[] = [];
+  private resolvedModelPath: string | null = null;
+  private modelPathResolutionPromise: Promise<string> | null = null;
   private llamaLoadPromise: Promise<Llama> | null = null;
   private modelLoadPromise: Promise<LlamaModel> | null = null;
   private contextsCreatePromise: Promise<LlamaEmbeddingContext[]> | null = null;
+  private sourceFallbackWarningReported = false;
   private usingCpuFallback = false;
   private disposed = false;
 
@@ -174,16 +180,18 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
       inputKinds: ["text"],
       limits: {
         maxBatchSize: entry.maxBatchSize,
+        maxConcurrentBatches: 1,
         maxInputTokens: entry.contextSize,
       },
     };
-    this.modelCacheDir =
+    this.modelCacheDir = resolve(
       options.modelCacheDir ??
-      process.env.ZVEC_GREP_MODEL_CACHE ??
-      DEFAULT_MODEL_CACHE_DIR;
+        process.env.ZVEC_GREP_MODEL_CACHE ??
+        DEFAULT_MODEL_CACHE_DIR,
+    );
     this.gpu = embeddingDeviceToLlamaGpuSelection(options.device ?? "cpu");
-    this.parallelism = resolveParallelismOverride(
-      process.env.ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM,
+    this.parallelism = normalizeLocalEmbeddingConcurrency(
+      options.embeddingConcurrency,
     );
     this.dependencies = { ...defaultDependencies, ...dependencies };
   }
@@ -192,7 +200,9 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
     contents: readonly Content[],
     options: NormalizedEmbeddingOptions,
   ): Promise<EmbeddingResult> {
-    return await this.embedBatch(contents, options);
+    return await this.embeddingQueue.run(() =>
+      this.embedBatch(contents, options),
+    );
   }
 
   private async embedBatch(
@@ -209,7 +219,7 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
     } catch (cause) {
       throw new EngineError("llama.cpp embedding failed", {
         code: "ZVEC_GREP.ENGINE.MODELS.LLAMA_CPP_EMBED_FAILED",
-        context: `model=${this.entry.reference}`,
+        context: `model=${this.entry.reference}${this.gpu !== false ? `; for GPU errors, retry with --device cpu${options.purpose === "document" ? ` or index with --index-embedding-concurrency 1 (environment fallback: ${INDEX_EMBEDDING_CONCURRENCY_ENV}=1)` : ""}` : ""}`,
         cause,
       });
     }
@@ -221,9 +231,11 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
     }
     this.disposed = true;
 
-    await this.disposeLoadedRuntime();
-    this.modelLoadPromise = null;
-    this.contextsCreatePromise = null;
+    await this.embeddingQueue.run(async () => {
+      await this.disposeLoadedRuntime();
+      this.modelLoadPromise = null;
+      this.contextsCreatePromise = null;
+    }, true);
   }
 
   private async embedTexts(
@@ -250,7 +262,9 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
       }))
       .filter((chunk) => chunk.texts.length > 0);
 
-    const results = await Promise.all(
+    // A rejected context must not release the batch queue while another context
+    // is still running, otherwise a retry/dispose could reuse or free it.
+    const results = await Promise.allSettled(
       chunks.map(async (chunk) => {
         const vectors: number[][] = [];
         for (const text of chunk.texts) {
@@ -261,8 +275,13 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
       }),
     );
 
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure) throw failure.reason;
+
     return {
-      vectors: results.flat(),
+      vectors: results.flatMap((result) =>
+        result.status === "fulfilled" ? result.value : [],
+      ),
       truncated: truncatedInputIndexes,
     };
   }
@@ -381,11 +400,15 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
     const downloadProgress = createModelDownloadProgressReporter(
       this.entry.reference,
       onProgress,
-      [basename(this.entry.uri)],
     );
     downloadProgress.start();
+    const modelPath = await this.ensureModelPath(downloadProgress);
+    // Runtime initialization owns its own GPU fallback. Keeping it outside the
+    // model-load retry prevents import and backend setup errors from being
+    // mislabeled as GPU model failures.
+    let llama = await this.ensureLlama(downloadProgress);
     try {
-      const model = await this.loadModel(downloadProgress);
+      const model = await this.loadModel(llama, modelPath);
       downloadProgress.finish();
       return model;
     } catch (error) {
@@ -399,17 +422,17 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
       }
       this.usingCpuFallback = true;
       await this.disposeLoadedRuntime();
-      const model = await this.loadModel(downloadProgress);
+      llama = await this.ensureLlama(downloadProgress);
+      const model = await this.loadModel(llama, modelPath);
       downloadProgress.finish();
       return model;
     }
   }
 
   private async loadModel(
-    downloadProgress: ModelDownloadProgressReporter,
+    llama: Llama,
+    modelPath: string,
   ): Promise<LlamaModel> {
-    const modelPath = await this.resolveModelPath(downloadProgress);
-    const llama = await this.ensureLlama(downloadProgress);
     const model = await llama.loadModel(this.modelLoadOptions(modelPath));
     this.model = model;
     return model;
@@ -429,6 +452,9 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
     textCount: number,
     onProgress?: (progress: EmbeddingModelProgress) => void,
   ): Promise<LlamaEmbeddingContext[]> {
+    // Resolve and load the model before automatic parallelism can initialize a
+    // GPU runtime. Artifact failures must never enter a GPU-to-CPU retry path.
+    await this.ensureModel(onProgress);
     const targetParallelism = await this.resolveEffectiveParallelism(textCount);
     if (this.contexts.length >= targetParallelism) {
       return this.contexts.slice(0, targetParallelism);
@@ -479,6 +505,9 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
     onProgress?: (progress: EmbeddingModelProgress) => void,
   ): Promise<LlamaEmbeddingContext[]> {
     const model = await this.ensureModel(onProgress);
+    if (this.shouldDisableModelGpuOffload() && this.parallelism === undefined) {
+      targetParallelism = 1;
+    }
     const threads = await this.resolveThreadsPerContext(targetParallelism);
     const initialContextCount = this.contexts.length;
 
@@ -533,25 +562,87 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
     this.llamaLoadPromise = null;
   }
 
+  private async ensureModelPath(
+    downloadProgress: ModelDownloadProgressReporter,
+  ): Promise<string> {
+    if (this.resolvedModelPath) {
+      return this.resolvedModelPath;
+    }
+    if (this.modelPathResolutionPromise) {
+      return await this.modelPathResolutionPromise;
+    }
+
+    this.modelPathResolutionPromise = this.resolveModelPath(downloadProgress);
+    try {
+      this.resolvedModelPath = await this.modelPathResolutionPromise;
+      return this.resolvedModelPath;
+    } finally {
+      this.modelPathResolutionPromise = null;
+    }
+  }
+
   private async resolveModelPath(
     downloadProgress: ModelDownloadProgressReporter,
   ): Promise<string> {
-    mkdirSync(this.modelCacheDir, { recursive: true });
-
-    const runtime = await this.loadRuntime();
-    const modelPath = await runtime.resolveModelFile(this.entry.uri, {
-      directory: this.modelCacheDir,
-      cli: false,
-      onProgress: ({ downloadedSize, totalSize }) => {
+    const artifact = this.entry.artifacts[0];
+    const resolvedArtifacts = await this.dependencies.resolveArtifacts({
+      model: this.entry.reference,
+      sources: this.createArtifactSources(artifact.path),
+      artifacts: this.entry.artifacts,
+      onDownloadPlan: (artifacts) => {
+        downloadProgress.setDownloadPlan(artifacts);
+      },
+      onProgress: (progress) => {
         downloadProgress.report({
-          artifact: basename(this.entry.uri),
-          downloadedBytes: downloadedSize,
-          totalBytes: totalSize,
+          artifact: progress.artifact,
+          downloadedBytes: progress.downloadedBytes,
         });
       },
+      onFallback: (warning) => {
+        if (this.sourceFallbackWarningReported) {
+          return;
+        }
+        this.sourceFallbackWarningReported = true;
+        reportLlamaWarning(downloadProgress, warning);
+      },
     });
+    const modelPath = resolvedArtifacts.paths[artifact.path];
+    if (!modelPath) {
+      throw new EngineError("Resolved GGUF artifact path is missing", {
+        code: "ZVEC_GREP.ENGINE.MODELS.LLAMA_CPP_MISSING_ARTIFACT",
+        context: `model=${this.entry.reference} artifact=${artifact.path}`,
+      });
+    }
     validateGgufFile(modelPath, this.entry.uri);
     return modelPath;
+  }
+
+  private createArtifactSources(
+    artifactPath: string,
+  ): readonly ModelArtifactSource[] {
+    const huggingFace = this.entry.sources.huggingFace;
+    const modelScope = this.entry.sources.modelScope;
+    return [
+      {
+        kind: "huggingface",
+        repo: huggingFace.repo,
+        revision: huggingFace.revision,
+        cacheDirectory: this.modelCacheDir,
+        localPaths: { [artifactPath]: this.entry.cacheFile },
+      },
+      {
+        kind: "modelscope",
+        repo: modelScope.repo,
+        revision: modelScope.revision,
+        cacheDirectory: resolve(
+          this.modelCacheDir,
+          "modelscope",
+          "llama-cpp",
+          modelScope.repo.replaceAll("/", "--"),
+          modelScope.revision,
+        ),
+      },
+    ];
   }
 
   private async resolveParallelism(): Promise<number> {
@@ -560,24 +651,10 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
     }
 
     const llama = await this.ensureLlama();
-    if (
-      !this.shouldDisableModelGpuOffload() &&
-      llama.gpu &&
-      llama.getVramState
-    ) {
-      try {
-        const vram = await llama.getVramState();
-        const freeMb = vram.free / (1024 * 1024);
-        return Math.max(
-          1,
-          Math.min(DEFAULT_PARALLELISM_CAP, Math.floor((freeMb * 0.25) / 150)),
-        );
-      } catch {
-        return 2;
-      }
-    }
-
-    return 1;
+    return await resolveLocalEmbeddingParallelism({
+      gpu: !this.shouldDisableModelGpuOffload() && Boolean(llama.gpu),
+      getVramState: llama.getVramState?.bind(llama),
+    });
   }
 
   private async resolveEffectiveParallelism(
@@ -706,25 +783,6 @@ function embeddingDeviceToLlamaGpuSelection(
   device: NonNullable<CreateEmbeddingModelOptions["device"]>,
 ): LlamaGpuSelection {
   return device === "cpu" ? false : device;
-}
-
-function resolveParallelismOverride(
-  envValue: string | undefined,
-): number | undefined {
-  const normalized = envValue?.trim() ?? "";
-  if (!normalized) {
-    return undefined;
-  }
-
-  const parsed = Number.parseInt(normalized, 10);
-  if (!Number.isInteger(parsed) || parsed < 1) {
-    process.stderr.write(
-      `zvec-grep warning: invalid ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM="${envValue}", using automatic parallelism.\n`,
-    );
-    return undefined;
-  }
-
-  return Math.min(DEFAULT_PARALLELISM_CAP, parsed);
 }
 
 function validateGgufFile(filePath: string, modelUri: string): void {

@@ -17,6 +17,7 @@ test("watch manager debounces file changes and reports overflow reconciliation",
   const batches = [];
   const manager = new WatchManager({
     root,
+    platform: "darwin",
     debounceMs: 5,
     maxWaitMs: 20,
     reconcileIntervalMs: 0,
@@ -43,7 +44,49 @@ test("watch manager debounces file changes and reports overflow reconciliation",
   }
 });
 
-test("watch manager uses per-directory watchers on Linux Node 22.0", async () => {
+test("scheduled reconciliation does not count as watcher activity", async () => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-watch-activity-"),
+  );
+  const root = join(temporaryDirectory, "repo");
+  await mkdir(root);
+  await writeFile(join(root, "a.ts"), "export const a = 1;\n");
+  let listener;
+  let activities = 0;
+  const reasons = [];
+  const watcher = new EventEmitter();
+  watcher.close = () => {};
+  const manager = new WatchManager({
+    root,
+    platform: "darwin",
+    debounceMs: 1,
+    maxWaitMs: 5,
+    reconcileIntervalMs: 10,
+    resumeCheckIntervalMs: 0,
+    watchFactory: (_root, _options, callback) => {
+      listener = callback;
+      return watcher;
+    },
+    onActivity: () => {
+      activities += 1;
+    },
+    onChanges: (_changes, reason) => reasons.push(reason),
+  });
+  try {
+    manager.start();
+    await waitFor(() => reasons.includes("reconcile"));
+    assert.equal(activities, 0);
+
+    listener("change", "a.ts");
+    await waitFor(() => activities === 1);
+    assert.equal(activities, 1);
+  } finally {
+    await manager.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("watch manager uses per-directory watchers on Linux", async () => {
   const temporaryDirectory = await mkdtemp(
     join(tmpdir(), "zvec-grep-watch-fallback-"),
   );
@@ -57,7 +100,6 @@ test("watch manager uses per-directory watchers on Linux Node 22.0", async () =>
   const manager = new WatchManager({
     root,
     platform: "linux",
-    nodeVersion: "22.0.0",
     debounceMs: 5,
     maxWaitMs: 20,
     reconcileIntervalMs: 0,
@@ -88,6 +130,153 @@ test("watch manager uses per-directory watchers on Linux Node 22.0", async () =>
   }
 });
 
+test("Linux watcher waits for root paths before registering directories", async () => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-watch-path-policy-"),
+  );
+  const root = join(temporaryDirectory, "repo");
+  const source = join(root, "src");
+  const dependencies = join(root, "node_modules");
+  await mkdir(source, { recursive: true });
+  await mkdir(join(dependencies, "pkg"), { recursive: true });
+  await writeFile(join(root, ".gitignore"), "node_modules/\n");
+  let rootPaths;
+  let rootPathReads = 0;
+  const watched = new Set();
+  const activeStates = [];
+  const reasons = [];
+  const manager = new WatchManager({
+    root,
+    platform: "linux",
+    debounceMs: 5,
+    maxWaitMs: 20,
+    reconcileIntervalMs: 0,
+    resumeCheckIntervalMs: 0,
+    getRootPaths: () => {
+      rootPathReads += 1;
+      return rootPaths;
+    },
+    onActiveChange: (active) => activeStates.push(active),
+    watchFactory: (directory, options) => {
+      assert.equal(options.recursive, false);
+      const watcher = new EventEmitter();
+      watcher.close = () => watched.delete(directory);
+      watched.add(directory);
+      return watcher;
+    },
+    onChanges: (_changes, reason) => reasons.push(reason),
+  });
+  try {
+    manager.start();
+    await waitFor(() => rootPathReads > 0);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual([...watched], []);
+    assert.deepEqual(activeStates, []);
+
+    rootPaths = [{ absolutePath: root, recursive: true }];
+    await manager.refreshPaths();
+    await waitFor(() => watched.has(source));
+    assert.equal(watched.has(root), true);
+    assert.equal(watched.has(dependencies), false);
+    assert.deepEqual(activeStates, [true]);
+    await waitFor(() => reasons.length === 1);
+    assert.deepEqual(reasons, ["reconcile"]);
+
+    await manager.refreshPaths();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(reasons, ["reconcile"]);
+  } finally {
+    await manager.close();
+    assert.deepEqual(activeStates, [true, false]);
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("recursive watcher keeps events while root paths are unavailable", async () => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-watch-policy-pending-event-"),
+  );
+  const root = join(temporaryDirectory, "repo");
+  const source = join(root, "src", "a.ts");
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(source, "export const a = 1;\n");
+  let listener;
+  const watcher = new EventEmitter();
+  watcher.close = () => {};
+  const batches = [];
+  const manager = new WatchManager({
+    root,
+    platform: "darwin",
+    debounceMs: 5,
+    maxWaitMs: 20,
+    reconcileIntervalMs: 0,
+    resumeCheckIntervalMs: 0,
+    getRootPaths: () => undefined,
+    watchFactory: (_directory, options, callback) => {
+      assert.equal(options.recursive, true);
+      listener = callback;
+      return watcher;
+    },
+    onChanges: (changes) => batches.push(changes),
+  });
+  try {
+    manager.start();
+    listener("change", "src/a.ts");
+    await waitFor(() => batches.length === 1);
+    assert.deepEqual(batches[0].touchedFiles, [source]);
+  } finally {
+    await manager.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("recursive watcher fallback starts after root paths become available", async () => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-watch-recursive-fallback-"),
+  );
+  const root = join(temporaryDirectory, "repo");
+  await mkdir(root);
+  let rootPaths;
+  let recursiveAttempts = 0;
+  const watched = new Set();
+  const activeStates = [];
+  const manager = new WatchManager({
+    root,
+    platform: "darwin",
+    reconcileIntervalMs: 0,
+    resumeCheckIntervalMs: 0,
+    getRootPaths: () => rootPaths,
+    onActiveChange: (active) => activeStates.push(active),
+    watchFactory: (directory, options) => {
+      if (options.recursive) {
+        recursiveAttempts += 1;
+        throw new Error("recursive watch unavailable");
+      }
+      const watcher = new EventEmitter();
+      watcher.close = () => watched.delete(directory);
+      watched.add(directory);
+      return watcher;
+    },
+    onChanges: () => {},
+  });
+  try {
+    manager.start();
+    await waitFor(() => recursiveAttempts === 1);
+    assert.deepEqual([...watched], []);
+    assert.deepEqual(activeStates, []);
+
+    rootPaths = [{ absolutePath: root, recursive: true }];
+    await manager.refreshPaths();
+    await waitFor(() => watched.has(root));
+    assert.equal(recursiveAttempts, 1);
+    assert.deepEqual(activeStates, [true]);
+  } finally {
+    await manager.close();
+    assert.deepEqual(activeStates, [true, false]);
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
 test("watch manager drops ignored file events before creating a change batch", async () => {
   const temporaryDirectory = await mkdtemp(
     join(tmpdir(), "zvec-grep-watch-ignore-"),
@@ -104,6 +293,7 @@ test("watch manager drops ignored file events before creating a change batch", a
   const pending = [];
   const manager = new WatchManager({
     root,
+    platform: "darwin",
     debounceMs: 5,
     maxWaitMs: 20,
     reconcileIntervalMs: 0,
@@ -145,7 +335,6 @@ test("fallback watcher prunes ignored directories and restores newly included on
   const manager = new WatchManager({
     root,
     platform: "linux",
-    nodeVersion: "22.0.0",
     debounceMs: 5,
     maxWaitMs: 20,
     reconcileIntervalMs: 0,
@@ -185,7 +374,6 @@ test("fallback watcher honors noIgnore when selecting directories", async () => 
   const manager = new WatchManager({
     root,
     platform: "linux",
-    nodeVersion: "22.0.0",
     reconcileIntervalMs: 0,
     getRootPaths: () => [
       { absolutePath: root, recursive: true, noIgnore: true },
@@ -229,7 +417,6 @@ test("fallback watcher mirrors scanner hidden-directory selection", async () => 
     const manager = new WatchManager({
       root,
       platform: "linux",
-      nodeVersion: "22.0.0",
       reconcileIntervalMs: 0,
       getRootPaths: () => [rootPath],
       watchFactory: (directory, options) => {
@@ -293,6 +480,7 @@ test("watch manager compacts an exact event storm into one directory scan", asyn
   const batches = [];
   const manager = new WatchManager({
     root,
+    platform: "darwin",
     debounceMs: 10,
     maxWaitMs: 30,
     reconcileIntervalMs: 0,
@@ -376,6 +564,7 @@ test("resume drift requests reconciliation and pending state spans debounce", as
   const reasons = [];
   const manager = new WatchManager({
     root,
+    platform: "darwin",
     debounceMs: 20,
     maxWaitMs: 40,
     reconcileIntervalMs: 0,
@@ -411,13 +600,16 @@ test("watcher errors trigger reconciliation and replace the failed watcher", asy
   const root = join(temporaryDirectory, "repo");
   await mkdir(root);
   const watchers = [];
+  const activeStates = [];
   const reasons = [];
   const manager = new WatchManager({
     root,
+    platform: "darwin",
     debounceMs: 5,
     maxWaitMs: 20,
     reconcileIntervalMs: 0,
     resumeCheckIntervalMs: 0,
+    onActiveChange: (active) => activeStates.push(active),
     watchFactory: () => {
       const created = new EventEmitter();
       created.close = () => {};
@@ -431,10 +623,93 @@ test("watcher errors trigger reconciliation and replace the failed watcher", asy
     watchers[0].emit("error", new Error("watch failed"));
     await waitFor(() => reasons.length === 1);
     await waitFor(() => watchers.length === 2);
+    await waitFor(() => reasons.length === 2);
     watchers[1].emit("error", new Error("watch still failed"));
     await waitFor(() => watchers.length === 3);
-    assert.equal(reasons[0], "reconcile");
-    assert.equal(reasons.length, 1);
+    await waitFor(() => reasons.length === 3);
+    assert.deepEqual(reasons, ["reconcile", "reconcile", "reconcile"]);
+    assert.deepEqual(activeStates, [true, false, true, false, true]);
+  } finally {
+    await manager.close();
+    assert.deepEqual(activeStates, [true, false, true, false, true, false]);
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("Linux root watcher retries synchronous failures before becoming active", async () => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-watch-sync-error-"),
+  );
+  const root = join(temporaryDirectory, "repo");
+  await mkdir(root);
+  let attempts = 0;
+  const activeStates = [];
+  const reasons = [];
+  const manager = new WatchManager({
+    root,
+    platform: "linux",
+    debounceMs: 5,
+    maxWaitMs: 20,
+    reconcileIntervalMs: 0,
+    resumeCheckIntervalMs: 0,
+    getRootPaths: () => [{ absolutePath: root, recursive: true }],
+    onActiveChange: (active) => activeStates.push(active),
+    watchFactory: () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error("ENOSPC");
+      }
+      const watcher = new EventEmitter();
+      watcher.close = () => {};
+      return watcher;
+    },
+    onChanges: (_changes, reason) => reasons.push(reason),
+  });
+  try {
+    manager.start();
+    assert.deepEqual(activeStates, []);
+    await waitFor(() => reasons.length === 1);
+    await waitFor(() => attempts === 2);
+    await waitFor(() => activeStates.includes(true));
+    await waitFor(() => reasons.length === 2);
+    assert.deepEqual(reasons, ["reconcile", "reconcile"]);
+  } finally {
+    await manager.close();
+    assert.deepEqual(activeStates, [true, false]);
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("Linux directory watcher does not retry a deleted directory", async () => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-watch-deleted-directory-"),
+  );
+  const root = join(temporaryDirectory, "repo");
+  await mkdir(root);
+  let attempts = 0;
+  const reasons = [];
+  const manager = new WatchManager({
+    root,
+    platform: "linux",
+    debounceMs: 5,
+    maxWaitMs: 20,
+    reconcileIntervalMs: 0,
+    resumeCheckIntervalMs: 0,
+    getRootPaths: () => [{ absolutePath: root, recursive: true }],
+    watchFactory: () => {
+      attempts += 1;
+      const error = new Error("directory was removed");
+      error.code = "ENOENT";
+      throw error;
+    },
+    onChanges: (_changes, reason) => reasons.push(reason),
+  });
+  try {
+    manager.start();
+    await waitFor(() => attempts === 1);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(attempts, 1);
+    assert.deepEqual(reasons, ["reconcile"]);
   } finally {
     await manager.close();
     await rm(temporaryDirectory, { recursive: true, force: true });
@@ -454,7 +729,6 @@ test("directory watcher retries are independent", async () => {
   const manager = new WatchManager({
     root,
     platform: "linux",
-    nodeVersion: "22.0.0",
     debounceMs: 5,
     maxWaitMs: 20,
     reconcileIntervalMs: 0,
@@ -501,6 +775,7 @@ test("close waits for an in-flight async change callback", async () => {
   watcher.close = () => {};
   const manager = new WatchManager({
     root,
+    platform: "darwin",
     debounceMs: 5,
     maxWaitMs: 20,
     reconcileIntervalMs: 0,

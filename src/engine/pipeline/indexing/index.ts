@@ -105,6 +105,18 @@ const EMBEDDING_TRANSIENT_RETRY_MAX_DELAY_MS = 8000;
 const EMBEDDING_RATE_LIMIT_RETRY_MAX_DELAY_MS = 30000;
 const EMBEDDING_RETRY_JITTER_MS = 500;
 const EMBEDDING_SUCCESS_STREAK_MIN = 4;
+const PERMANENT_REMOTE_MODEL_PROVIDER_CODES = new Set([
+  "invalid_model",
+  "model_not_found",
+  "unsupported_model",
+  "invalid_dimension",
+  "invalid_dimensions",
+  "unsupported_dimension",
+  "unsupported_dimensions",
+  "dimension_out_of_range",
+  "invalid_embedding_dimension",
+  "unsupported_embedding_dimension",
+]);
 
 type EmbeddingScheduler = {
   readonly taskConcurrency: number;
@@ -121,6 +133,7 @@ type EmbeddingScheduler = {
 type EmbeddingRetryClassification = {
   retryable: boolean;
   rateLimited: boolean;
+  failFast: boolean;
   retryAfterMs?: number;
 };
 
@@ -263,31 +276,7 @@ async function indexWorkspaceUnchecked(
 
   if (result.filesFailed > 0) {
     report({ phase: "done", detail: "Indexing completed with failed files" });
-    throw new EngineError(
-      `Indexing completed with ${result.filesFailed} failed ${result.filesFailed === 1 ? "file" : "files"}`,
-      {
-        code: "ZVEC_GREP.ENGINE.INDEXING.FILES_FAILED",
-        context: errorDetails([
-          workspaceIndexDetail(ctx.workspaceIndex.name),
-          detail("filesFailed", result.filesFailed),
-          detail("filesScanned", result.filesScanned),
-          detail(
-            "failedFiles",
-            summarizeFailedFiles(finalPass.stats.failedFiles),
-          ),
-          detail(
-            "failedReasons",
-            summarizeFailedFiles(finalPass.stats.failedFileReasons),
-          ),
-          detail(
-            "hint",
-            passes.length > 1
-              ? "Retried failed files once automatically; if failures persist, fix the failed files or embedding configuration."
-              : "If the failure was transient, rerun the same indexing command; if it persists, fix the failed files or embedding configuration.",
-          ),
-        ]),
-      },
-    );
+    throw filesFailedError(ctx, result, finalPass, passes.length);
   }
 
   report({ phase: "done", detail: "Indexing complete" });
@@ -329,16 +318,43 @@ async function indexWorkspacePathsUnchecked(
   await timings.time("index_optimize", () => optimizeStorage(ctx));
   const result = buildIndexResult(ctx, passes, Date.now() - start, timings);
   if (result.filesFailed > 0) {
-    throw new EngineError(
-      `Indexing completed with ${result.filesFailed} failed files`,
-      {
-        code: "ZVEC_GREP.ENGINE.INDEXING.FILES_FAILED",
-        context: workspaceIndexContext(ctx.workspaceIndex),
-      },
-    );
+    throw filesFailedError(ctx, result, finalPass, passes.length);
   }
   report({ phase: "done", detail: "Indexing complete" });
   return result;
+}
+
+function filesFailedError(
+  ctx: IndexContext,
+  result: IndexResult,
+  finalPass: IndexPassResult,
+  passCount: number,
+): EngineError {
+  return new EngineError(
+    `Indexing completed with ${result.filesFailed} failed ${result.filesFailed === 1 ? "file" : "files"}`,
+    {
+      code: "ZVEC_GREP.ENGINE.INDEXING.FILES_FAILED",
+      context: errorDetails([
+        workspaceIndexDetail(ctx.workspaceIndex.name),
+        detail("filesFailed", result.filesFailed),
+        detail("filesScanned", result.filesScanned),
+        detail(
+          "failedFiles",
+          summarizeFailedFiles(finalPass.stats.failedFiles),
+        ),
+        detail(
+          "failedReasons",
+          summarizeFailedFiles(finalPass.stats.failedFileReasons),
+        ),
+        detail(
+          "hint",
+          passCount > 1
+            ? "Retried failed files once automatically; if failures persist, fix the failed files or embedding configuration."
+            : "If the failure was transient, rerun the same indexing command; if it persists, fix the failed files or embedding configuration.",
+        ),
+      ]),
+    },
+  );
 }
 
 async function runPathIndexPass(
@@ -718,14 +734,27 @@ async function indexFiles(
   );
   const embeddingTiming = new ConcurrentTiming(timings, "index_embedding");
   const runningEmbeddings = new Set<Promise<void>>();
+  let firstEmbeddingError: { error: unknown } | undefined;
+  const prepareModel =
+    ctx.embeddingModel.info.provider === "local"
+      ? ctx.embeddingModel.prepare?.bind(ctx.embeddingModel)
+      : undefined;
+  let modelPrepared = false;
   const reportEmbeddingProgress = (
     currentStats: IndexStats,
     detail: string,
   ): void => {
     onProgress(currentStats, detail, embeddingScheduler.snapshot());
   };
+  const throwFirstEmbeddingError = (): void => {
+    const failure = firstEmbeddingError;
+    if (failure) {
+      throw failure.error;
+    }
+  };
 
   const flushBatch = async (): Promise<void> => {
+    throwFirstEmbeddingError();
     throwIfIndexCancelled(ctx);
     if (batchFiles.length === 0) {
       return;
@@ -750,25 +779,60 @@ async function indexFiles(
   const scheduleEmbeddingTask = async (
     task: () => Promise<void>,
   ): Promise<void> => {
+    throwFirstEmbeddingError();
     throwIfIndexCancelled(ctx);
-    const promise = task().finally(() => {
+    if (!modelPrepared && prepareModel) {
+      // Finish shared initialization before any file or fragment batch is queued.
+      try {
+        await embeddingTiming.time(() =>
+          prepareModel({
+            signal: ctx.signal,
+            onProgress: (progress) =>
+              reportModelDownloadProgress(
+                stats,
+                progress,
+                onProgress,
+                embeddingScheduler,
+              ),
+          }),
+        );
+      } catch (error) {
+        throwIfIndexCancelled(ctx);
+        throw error;
+      }
+      throwIfIndexCancelled(ctx);
+    }
+    modelPrepared = true;
+    const cleanup = (): void => {
       runningEmbeddings.delete(promise);
-    });
+    };
+    const promise = Promise.resolve()
+      .then(task)
+      .then(cleanup, (error: unknown) => {
+        if (!firstEmbeddingError) {
+          firstEmbeddingError = { error };
+        }
+        cleanup();
+      });
 
     runningEmbeddings.add(promise);
 
     if (runningEmbeddings.size >= embeddingScheduler.taskConcurrency) {
       await Promise.race(runningEmbeddings);
     }
+    throwFirstEmbeddingError();
+    throwIfIndexCancelled(ctx);
   };
 
   try {
     for (const file of files) {
+      throwFirstEmbeddingError();
       throwIfIndexCancelled(ctx);
       onProgress(stats, `reading ${file.relativePath}`);
       const prepared = await timings.time("index_prepare", () =>
         prepareFile(file, ctx),
       );
+      throwFirstEmbeddingError();
       throwIfIndexCancelled(ctx);
 
       if ("failedReason" in prepared) {
@@ -821,6 +885,8 @@ async function indexFiles(
 
     await flushBatch();
     await Promise.all(runningEmbeddings);
+    throwFirstEmbeddingError();
+    throwIfIndexCancelled(ctx);
   } catch (error) {
     await Promise.allSettled(runningEmbeddings);
     throw error;
@@ -926,13 +992,8 @@ async function embedAndCommitBatch(
     if (indexIsCancelled(ctx)) {
       throw indexCancellationError(ctx);
     }
-    if (isRetryableEmbeddingError(error)) {
-      for (const file of files) {
-        const reason = markFileFailed(ctx, file.file, error, "embed");
-        recordFileFailed(stats, file.file, reason);
-        onProgress(stats, finishedFileDetail(false, file.file.relativePath));
-      }
-      return;
+    if (shouldFailFastEmbeddingError(error, ctx.embeddingModel)) {
+      throw error;
     }
 
     for (const file of files) {
@@ -994,6 +1055,9 @@ async function embedAndCommitFile(
   } catch (error) {
     if (indexIsCancelled(ctx)) {
       throw indexCancellationError(ctx);
+    }
+    if (shouldFailFastEmbeddingError(error, ctx.embeddingModel)) {
+      throw error;
     }
     const reason = markFileFailed(ctx, file.file, error, "embed");
     recordFileFailed(stats, file.file, reason);
@@ -1151,6 +1215,10 @@ async function embedFragments(
 
   const vectors: number[][] = new Array(fragments.length);
   const truncatedInputIndexes: number[] = [];
+  const batchAbortController = new AbortController();
+  const batchSignal = signal
+    ? AbortSignal.any([signal, batchAbortController.signal])
+    : batchAbortController.signal;
   const results = await Promise.allSettled(
     batches.map((batch) =>
       embedFragmentBatch(
@@ -1158,8 +1226,9 @@ async function embedFragments(
         model,
         batch.start,
         embeddingScheduler,
-        signal,
+        batchSignal,
         onModelProgress,
+        (error) => batchAbortController.abort(error),
       ),
     ),
   );
@@ -1197,6 +1266,7 @@ async function embedFragmentBatch(
   embeddingScheduler: EmbeddingScheduler,
   signal?: AbortSignal,
   onModelProgress?: (progress: EmbeddingModelProgress) => void,
+  onTerminalFailure?: (error: unknown) => void,
 ): Promise<EmbeddingResult> {
   const contents = fragments.map((fragment) => fragment.embeddingContent);
 
@@ -1207,9 +1277,10 @@ async function embedFragmentBatch(
       embeddingScheduler,
       signal,
       onModelProgress,
+      onTerminalFailure,
     );
   } catch (error) {
-    if (fragments.length === 1 || isRetryableEmbeddingError(error)) {
+    if (fragments.length === 1 || shouldFailFastEmbeddingError(error, model)) {
       throw error;
     }
 
@@ -1220,6 +1291,7 @@ async function embedFragmentBatch(
       embeddingScheduler,
       signal,
       onModelProgress,
+      onTerminalFailure,
     );
   }
 }
@@ -1231,6 +1303,7 @@ async function embedFragmentBatchOneByOne(
   embeddingScheduler: EmbeddingScheduler,
   signal?: AbortSignal,
   onModelProgress?: (progress: EmbeddingModelProgress) => void,
+  onTerminalFailure?: (error: unknown) => void,
 ): Promise<EmbeddingResult> {
   const vectors: number[][] = [];
   const truncatedInputIndexes: number[] = [];
@@ -1243,12 +1316,16 @@ async function embedFragmentBatchOneByOne(
         embeddingScheduler,
         signal,
         onModelProgress,
+        onTerminalFailure,
       );
       vectors.push(result.vectors[0]);
       if (result.truncated.length > 0) {
         truncatedInputIndexes.push(index);
       }
     } catch (error) {
+      if (shouldFailFastEmbeddingError(error, model)) {
+        throw error;
+      }
       throw new EngineError(
         "Embedding entity fragment failed after one-by-one fallback",
         {
@@ -1279,6 +1356,7 @@ async function embedContentsWithRetry(
   embeddingScheduler: EmbeddingScheduler,
   signal?: AbortSignal,
   onModelProgress?: (progress: EmbeddingModelProgress) => void,
+  onTerminalFailure?: (error: unknown) => void,
 ): Promise<EmbeddingResult> {
   let attempt = 0;
 
@@ -1297,13 +1375,19 @@ async function embedContentsWithRetry(
           }),
         signal,
         (error) => {
-          retry = classifyEmbeddingRetry(error);
+          retry = classifyEmbeddingRetry(error, model);
           delayMs = retryDelayMs(attempt, retry);
           if (retry.retryable) {
             embeddingScheduler.recordRetryableFailure({
               rateLimited: retry.rateLimited,
               delayMs,
             });
+          }
+          if (
+            retry.failFast &&
+            (!retry.retryable || attempt >= maxRetryAttempts(retry))
+          ) {
+            onTerminalFailure?.(error);
           }
         },
       );
@@ -1316,7 +1400,7 @@ async function embedContentsWithRetry(
           : new Error("Embedding was cancelled.");
       }
       if (!retry.retryable) {
-        retry = classifyEmbeddingRetry(error);
+        retry = classifyEmbeddingRetry(error, model);
         delayMs = retryDelayMs(attempt, retry);
       }
 
@@ -1360,11 +1444,15 @@ function resolveEmbeddingConcurrencyPolicy(
     Number.isInteger(requestedConcurrency) &&
     requestedConcurrency > 0
   ) {
+    const concurrency = Math.min(
+      requestedConcurrency,
+      model.info.limits.maxConcurrentBatches ?? requestedConcurrency,
+    );
     return {
-      initial: requestedConcurrency,
+      initial: concurrency,
       min: 1,
-      max: requestedConcurrency,
-      adaptive: requestedConcurrency > 1,
+      max: concurrency,
+      adaptive: concurrency > 1,
     };
   }
 
@@ -1529,36 +1617,175 @@ function oneLine(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function isRetryableEmbeddingError(error: unknown): boolean {
-  return classifyEmbeddingRetry(error).retryable;
+function shouldFailFastEmbeddingError(
+  error: unknown,
+  model: EmbeddingModel,
+): boolean {
+  return classifyEmbeddingRetry(error, model).failFast;
 }
 
-function classifyEmbeddingRetry(error: unknown): EmbeddingRetryClassification {
-  const message = errorToMessage(error);
-  const context =
-    isEngineError(error) && error.context ? ` ${error.context}` : "";
-  const text = `${message}${context}`;
+function classifyEmbeddingRetry(
+  error: unknown,
+  model: EmbeddingModel,
+): EmbeddingRetryClassification {
+  const codes = errorCodes(error);
+  const text = errorChainText(error);
   const status = httpStatusFromText(text);
+  const remoteEmbedding = model.info.provider !== "local";
   const rateLimited =
-    status === 429 ||
-    /rate limit|quota exceeded|too many requests|request rate increased too quickly/i.test(
-      text,
-    );
+    remoteEmbedding &&
+    (status === 429 ||
+      /rate limit|quota exceeded|too many requests|request rate increased too quickly/i.test(
+        text,
+      ));
   const serverError =
-    typeof status === "number" && status >= 500 && status <= 599;
+    remoteEmbedding &&
+    typeof status === "number" &&
+    status >= 500 &&
+    status <= 599;
+  const requestTimeout = remoteEmbedding && status === 408;
+  const requestFailure = codes.some((code) => code.endsWith("_REQUEST_FAILED"));
+  const transientNetworkFailure =
+    remoteEmbedding && requestFailure && isTransientNetworkFailure(text);
+  const sharedLocalModelFailure = codes.some(
+    (code) =>
+      code === "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED" ||
+      code === "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_LOAD_FAILED" ||
+      code === "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DISPOSED" ||
+      code === "ZVEC_GREP.ENGINE.MODELS.TRANSFORMERS_JS_LOAD_FAILED",
+  );
+  const retryable =
+    !sharedLocalModelFailure &&
+    (rateLimited || serverError || requestTimeout || transientNetworkFailure);
+  const remoteConfigurationFailure =
+    remoteEmbedding &&
+    (codes.some(
+      (code) =>
+        code.endsWith("_MISSING_API_KEY") || code.endsWith("_MISSING_ENDPOINT"),
+    ) ||
+      status === 401 ||
+      status === 403 ||
+      status === 404 ||
+      /\b(?:invalid|missing|unauthorized|forbidden)[ _-]?(?:api[ _-]?)?key\b/i.test(
+        text,
+      ));
+  const permanentRemoteModelFailure =
+    remoteEmbedding &&
+    (codes.includes("ZVEC_GREP.ENGINE.MODELS.EMBEDDING_DIMENSION_MISMATCH") ||
+      (status === 400 && isPermanentRemoteModelBadRequest(text)));
 
   return {
-    retryable: rateLimited || serverError,
+    retryable,
     rateLimited,
+    failFast:
+      retryable ||
+      sharedLocalModelFailure ||
+      remoteConfigurationFailure ||
+      permanentRemoteModelFailure ||
+      (remoteEmbedding && requestFailure),
     retryAfterMs: retryAfterMsFromText(text),
   };
+}
+
+function isPermanentRemoteModelBadRequest(text: string): boolean {
+  const providerCode = /\bproviderCode=([^\s]+)/i.exec(text)?.[1];
+  const normalizedCode = providerCode
+    ?.replace(/[^a-z0-9]+/gi, "_")
+    .replace(/^_+|_+$/g, "")
+    .toLowerCase();
+  if (
+    normalizedCode &&
+    PERMANENT_REMOTE_MODEL_PROVIDER_CODES.has(normalizedCode)
+  ) {
+    return true;
+  }
+
+  const providerMessage = /\bproviderMessage=(.*?)(?=\s+ZVEC_GREP\.|$)/i.exec(
+    text,
+  )?.[1];
+  return (
+    providerMessage !== undefined &&
+    /(?:\b(?:invalid|unsupported|unknown)\b.{0,48}\bmodel\b|\bmodel\b.{0,48}\b(?:invalid|unsupported|unknown|not found|does not exist)\b|\b(?:invalid|unsupported|out of range)\b.{0,48}\bdimensions?\b|\bdimensions?\b.{0,48}\b(?:invalid|unsupported|not supported|out of range|must|should|expected|between|only supports?)\b)/i.test(
+      providerMessage,
+    )
+  );
 }
 
 function nonRetryableEmbeddingError(): EmbeddingRetryClassification {
   return {
     retryable: false,
     rateLimited: false,
+    failFast: false,
   };
+}
+
+function errorCodes(error: unknown): string[] {
+  const codes: string[] = [];
+
+  for (const current of errorChain(error)) {
+    if (
+      typeof current === "object" &&
+      current !== null &&
+      "code" in current &&
+      typeof current.code === "string"
+    ) {
+      codes.push(current.code);
+    }
+  }
+
+  return codes;
+}
+
+function errorChainText(error: unknown): string {
+  const parts: string[] = [];
+
+  for (const current of errorChain(error)) {
+    if (current instanceof Error) {
+      parts.push(current.name, current.message);
+    } else {
+      parts.push(String(current));
+    }
+    if (isEngineError(current) && current.context) {
+      parts.push(current.context);
+    }
+    if (
+      typeof current === "object" &&
+      current !== null &&
+      "code" in current &&
+      typeof current.code === "string"
+    ) {
+      parts.push(current.code);
+    }
+  }
+
+  return parts.join(" ");
+}
+
+function errorChain(error: unknown): unknown[] {
+  const chain: unknown[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+
+  while (current !== undefined && current !== null && !seen.has(current)) {
+    seen.add(current);
+    chain.push(current);
+    if (
+      typeof current !== "object" ||
+      !("cause" in current) ||
+      current.cause === undefined
+    ) {
+      break;
+    }
+    current = current.cause;
+  }
+
+  return chain;
+}
+
+function isTransientNetworkFailure(text: string): boolean {
+  return /\b(?:EAI_AGAIN|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETDOWN|ENETUNREACH|ENOTFOUND|ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|UND_ERR_SOCKET|TimeoutError)\b|connection (?:reset|timed out)|network connection (?:failed|was lost)|socket hang up|temporary failure/i.test(
+    text,
+  );
 }
 
 function maxRetryAttempts(retry: EmbeddingRetryClassification): number {

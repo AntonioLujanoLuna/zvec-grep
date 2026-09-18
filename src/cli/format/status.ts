@@ -9,12 +9,14 @@ import type {
 } from "../../index.js";
 import type { RemoteEmbeddingAuthorizationStatus } from "../../authorization/types.js";
 import type { CliOptions } from "../types.js";
+import { formatContextLines, modelDownloadFailureMessage } from "../errors.js";
 import { shouldUseColor } from "./highlight.js";
 import { formatGreenProgressBar } from "./progress.js";
 import {
   indexCompletionFromStatus,
   indexStatusNeedsRefresh as statusNeedsRefresh,
 } from "../../engine/index-status.js";
+import { redactErrorText } from "../../engine/errors.js";
 
 type StatusTheme = {
   color: boolean;
@@ -40,6 +42,7 @@ export type WorkspaceIndexState =
 type WorkspaceRootPath = WorkspaceIndexInfo["rootPaths"][number];
 
 type WorkspaceStatusView = {
+  debug?: boolean;
   root: string;
   indexPath: string;
   policy: "enabled" | "disabled" | "undecided";
@@ -63,6 +66,8 @@ type WorkspaceStatusView = {
   error?: {
     code: string;
     message: string;
+    context?: string;
+    cause?: string;
   };
   failedReasons?: string;
 };
@@ -134,6 +139,8 @@ type ServerIndexInfo = {
     error?: {
       code: string;
       message: string;
+      context?: string;
+      cause?: string;
     };
   };
 };
@@ -163,7 +170,7 @@ export function printRemoteEmbeddingAuthorizationStatus(
     console.log("");
     console.log(theme.accent("Run"));
     console.log(
-      `  ${theme.path("zg auth grant --capability embedding --scope workspace")}`,
+      `  ${theme.path("zg --auth grant --capability embedding --scope workspace")}`,
     );
     return;
   }
@@ -216,10 +223,11 @@ export function printWorkspaceInfo(
   const status = info.status ?? undefined;
   const completion = indexCompletionFromStatus(status);
   const suggestion =
-    status && statusNeedsRefresh(status) ? "zg index" : info.suggestion;
+    status && statusNeedsRefresh(status) ? "zg --index" : info.suggestion;
 
   const state = workspaceState(info);
   printWorkspaceIndexStatus(theme, {
+    debug: options.debug,
     root: info.root,
     indexPath: info.indexPath,
     policy: info.indexPolicy,
@@ -245,7 +253,7 @@ export function printWorkspaceInfo(
       : undefined,
     suggestion,
     failedReasons: status
-      ? summarizeFailedFileReasons(status.failedFiles, "zg index")
+      ? summarizeFailedFileReasons(status.failedFiles, "zg --index")
       : undefined,
   });
   return state;
@@ -264,6 +272,7 @@ export function printServerIndexInfo(
   const completion = info.runtime?.completion;
 
   printWorkspaceIndexStatus(theme, {
+    debug: options.debug,
     root: info.root,
     indexPath: info.persistent.index_path,
     policy: info.index_policy,
@@ -388,17 +397,52 @@ function printWorkspaceIndexStatus(
 
   const diagnostics: string[] = [];
   if (view.error) {
+    const downloadFailure = modelDownloadFailureMessage(view.error);
     diagnostics.push(
-      ...formatStatusField(theme, "Error", [
-        theme.danger(view.error.code),
-        theme.danger(view.error.message),
-      ]),
+      ...formatStatusField(
+        theme,
+        "Error",
+        (downloadFailure
+          ? [downloadFailure, ...(view.debug ? [view.error.code] : [])]
+          : [view.error.code, view.error.message]
+        ).map((line) => theme.danger(line)),
+      ),
     );
+    if (view.error.context && (!downloadFailure || view.debug)) {
+      diagnostics.push(
+        ...formatStatusField(
+          theme,
+          "Details",
+          formatContextLines(view.error.context).map((line) =>
+            theme.danger(line),
+          ),
+        ),
+      );
+    }
+    if (view.error.cause && (!downloadFailure || view.debug)) {
+      diagnostics.push(
+        ...formatStatusField(theme, "Cause", theme.danger(view.error.cause)),
+      );
+    }
   }
   if (view.failedReasons) {
+    const failedReasons = redactErrorText(view.failedReasons, 4_096);
+    const downloadFailure = modelDownloadFailureMessage({
+      code: "ZVEC_GREP.ENGINE.INDEXING.FILES_FAILED",
+      context: `failedReasons=${failedReasons}`,
+    });
     diagnostics.push(
-      ...formatStatusField(theme, "Problem", theme.danger(view.failedReasons)),
+      ...formatStatusField(
+        theme,
+        downloadFailure ? "Error" : "Problem",
+        theme.danger(downloadFailure ?? failedReasons),
+      ),
     );
+    if (downloadFailure && view.debug) {
+      diagnostics.push(
+        ...formatStatusField(theme, "Details", theme.danger(failedReasons)),
+      );
+    }
   }
   if (view.suggestion) {
     diagnostics.push(
@@ -682,7 +726,7 @@ export function printNoIndexableFilesTip(options: CliOptions): void {
     theme,
     "tip",
     theme.warning(
-      "No indexable files were found. Run `zg help file-types` to review supported file types and indexing rules.",
+      "No indexable files were found. Run `zg --help file-types` to review supported file types and indexing rules.",
     ),
   );
 }
@@ -720,7 +764,12 @@ function summarizeFailedFileReasons(
     .slice(0, 3)
     .map(
       (file) =>
-        `${file.relativePath}: ${clipReason(explainStoredFailureReason(file.indexStatus!.error!, retryCommand))}`,
+        `${file.relativePath}: ${clipReason(
+          redactErrorText(
+            explainStoredFailureReason(file.indexStatus!.error!, retryCommand),
+            4_096,
+          ),
+        )}`,
     );
   const remaining = withReasons.length - shown.length;
 

@@ -1,18 +1,39 @@
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { Model2VecEmbeddingModel } from "../../../dist/engine/models/backends/model2vec.js";
 import { createTemporaryDirectory } from "../../helpers/fixtures.mjs";
 
 function entry(overrides = {}) {
+  const repo = overrides.repo ?? "test/potion";
+  const revision = overrides.revision ?? "0123456789abcdef";
   return {
     backend: "model2vec",
     reference: "local/test-potion",
     provider: "local",
     model: "test-potion",
-    repo: "test/potion",
-    revision: "0123456789abcdef",
+    repo,
+    revision,
+    sources: {
+      huggingFace: { repo, revision },
+      modelScope: {
+        repo: `mirror/${repo}`,
+        revision: "fedcba9876543210",
+      },
+    },
+    artifacts: [
+      {
+        path: "model.safetensors",
+        size: 8,
+        sha256: "a".repeat(64),
+      },
+      {
+        path: "tokenizer.json",
+        size: 8,
+        sha256: "b".repeat(64),
+      },
+    ],
     modelFile: "model.safetensors",
     embeddingTensor: "embeddings",
     tokenizerFile: "tokenizer.json",
@@ -25,6 +46,28 @@ function entry(overrides = {}) {
     maxBatchSize: 32,
     defaultConcurrency: 2,
     ...overrides,
+  };
+}
+
+function createArtifactResolver(onResolve) {
+  return async (options) => {
+    onResolve?.(options);
+    const source = options.sources[0];
+    const paths = Object.fromEntries(
+      options.artifacts.map((artifact) => [
+        artifact.path,
+        join(
+          source.cacheDirectory,
+          source.localPaths?.[artifact.path] ?? artifact.path,
+        ),
+      ]),
+    );
+    await Promise.all(
+      Object.values(paths).map((path) =>
+        mkdir(dirname(path), { recursive: true }),
+      ),
+    );
+    return { source, directory: source.cacheDirectory, paths };
   };
 }
 
@@ -59,7 +102,7 @@ async function writeSafetensors(path, dtype, values, shape) {
 
 test("Model2Vec downloads pinned Safetensors assets and performs normalized static lookup", async (t) => {
   const root = await createTemporaryDirectory(t, "zvec-model2vec-");
-  const calls = { downloads: [], tokenizerLoads: [], tableLoads: [] };
+  const calls = { resolutions: [], tokenizerLoads: [], tableLoads: [] };
   const downloadProgress = [];
   const tokenizer = Object.assign(
     async (text, options) => {
@@ -93,13 +136,26 @@ test("Model2Vec downloads pinned Safetensors assets and performs normalized stat
         rows: 3,
       };
     },
-    async download(url, destination, onProgress) {
-      calls.downloads.push(url);
-      onProgress?.({ downloadedBytes: 4, totalBytes: 8 });
-      await writeFile(
-        destination,
-        url.endsWith("tokenizer.json") ? "{}" : "weights",
-      );
+    async resolveArtifacts(options) {
+      calls.resolutions.push(options);
+      options.onDownloadPlan?.(options.artifacts);
+      options.onProgress?.({
+        model: options.model,
+        source: "huggingface",
+        artifact: options.artifacts[0].path,
+        downloadedBytes: 0,
+        totalBytes: options.artifacts[0].size,
+      });
+      for (const artifact of options.artifacts) {
+        options.onProgress?.({
+          model: options.model,
+          source: "huggingface",
+          artifact: artifact.path,
+          downloadedBytes: 4,
+          totalBytes: 8,
+        });
+      }
+      return await createArtifactResolver()(options);
     },
   };
 
@@ -112,6 +168,15 @@ test("Model2Vec downloads pinned Safetensors assets and performs normalized stat
     dependencies,
   );
   assert.equal(model.info.defaultConcurrency, 2);
+  await model.prepare({
+    onProgress: (progress) => downloadProgress.push(progress),
+  });
+  assert.equal(calls.tokenizerCalls, undefined);
+  assert.equal(calls.tableLoads.length, 1);
+  assert.equal(calls.tokenizerLoads.length, 1);
+  await model.prepare({
+    onProgress: (progress) => downloadProgress.push(progress),
+  });
   const { vectors } = await model.embed(
     [
       { kind: "text", text: "both tokens" },
@@ -138,9 +203,49 @@ test("Model2Vec downloads pinned Safetensors assets and performs normalized stat
     truncation: true,
     max_length: 513,
   });
-  assert.equal(calls.downloads.length, 2);
-  assert.ok(calls.downloads.some((url) => url.endsWith("model.safetensors")));
-  assert.ok(calls.downloads.some((url) => url.endsWith("tokenizer.json")));
+  assert.equal(calls.resolutions.length, 1);
+  const { onDownloadPlan, onProgress, onFallback, ...resolution } =
+    calls.resolutions[0];
+  assert.equal(typeof onDownloadPlan, "function");
+  assert.equal(typeof onProgress, "function");
+  assert.equal(typeof onFallback, "function");
+  assert.deepEqual(resolution, {
+    model: "local/test-potion",
+    sources: [
+      {
+        kind: "huggingface",
+        repo: "test/potion",
+        revision: "0123456789abcdef",
+        cacheDirectory: join(
+          root,
+          "model2vec",
+          "test--potion",
+          "0123456789abcdef",
+        ),
+        localPaths: {
+          "model.safetensors": "model.safetensors",
+          "tokenizer.json": "tokenizer/tokenizer.json",
+        },
+      },
+      {
+        kind: "modelscope",
+        repo: "mirror/test/potion",
+        revision: "fedcba9876543210",
+        cacheDirectory: join(
+          root,
+          "modelscope",
+          "model2vec",
+          "mirror--test--potion",
+          "fedcba9876543210",
+        ),
+        localPaths: {
+          "model.safetensors": "model.safetensors",
+          "tokenizer.json": "tokenizer/tokenizer.json",
+        },
+      },
+    ],
+    artifacts: entry().artifacts,
+  });
   assert.deepEqual(downloadProgress, [
     {
       stage: "preparing",
@@ -149,7 +254,14 @@ test("Model2Vec downloads pinned Safetensors assets and performs normalized stat
     {
       stage: "downloading",
       model: "local/test-potion",
+      downloadedBytes: 0,
+      totalBytes: 16,
+    },
+    {
+      stage: "downloading",
+      model: "local/test-potion",
       downloadedBytes: 4,
+      totalBytes: 16,
     },
     {
       stage: "downloading",
@@ -177,7 +289,7 @@ test("Model2Vec downloads pinned Safetensors assets and performs normalized stat
   });
 
   await model.embed([{ kind: "text", text: "cached" }]);
-  assert.equal(calls.downloads.length, 2);
+  assert.equal(calls.resolutions.length, 1);
   assert.equal(calls.tokenizerLoads.length, 1);
   assert.equal(calls.tableLoads.length, 1);
 
@@ -186,6 +298,34 @@ test("Model2Vec downloads pinned Safetensors assets and performs normalized stat
   await assert.rejects(
     model.embed([{ kind: "text", text: "after dispose" }]),
     /disposed/,
+  );
+});
+
+test("Model2Vec preparation respects cancellation and disposal before loading", async () => {
+  const model = new Model2VecEmbeddingModel(
+    entry(),
+    { modelCacheDir: "/unused" },
+    {
+      async resolveArtifacts() {
+        assert.fail("cancelled or disposed preparation must not download");
+      },
+    },
+  );
+  const cancelled = new Error("cancelled before model preparation");
+  const progress = [];
+  await assert.rejects(
+    model.prepare({
+      signal: AbortSignal.abort(cancelled),
+      onProgress: (event) => progress.push(event),
+    }),
+    (error) => error === cancelled,
+  );
+  assert.deepEqual(progress, []);
+
+  await model.dispose();
+  await assert.rejects(
+    model.prepare(),
+    (error) => error.code === "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DISPOSED",
   );
 });
 
@@ -202,9 +342,7 @@ test("Model2Vec parses real F32 and F16 Safetensors embedding tables", async (t)
         { unk_token_id: 99 },
       );
     },
-    async download() {
-      throw new Error("cached test assets should not be downloaded");
-    },
+    resolveArtifacts: createArtifactResolver(),
   };
 
   const fixtures = [
@@ -278,6 +416,11 @@ test("Model2Vec excludes cached artifacts from overall download progress", async
   );
   await mkdir(dirname(tokenizerPath), { recursive: true });
   await writeFile(tokenizerPath, "{}");
+  const tokenizerConfigPath = join(
+    dirname(tokenizerPath),
+    "tokenizer_config.json",
+  );
+  await writeFile(tokenizerConfigPath, "{");
 
   const dependencies = {
     async loadTokenizer() {
@@ -294,9 +437,23 @@ test("Model2Vec excludes cached artifacts from overall download progress", async
         rows: 1,
       };
     },
-    async download(_url, destination, onProgress) {
-      onProgress?.({ downloadedBytes: 4, totalBytes: 8 });
-      await writeFile(destination, "weights");
+    async resolveArtifacts(options) {
+      options.onDownloadPlan?.([options.artifacts[0]]);
+      options.onProgress?.({
+        model: options.model,
+        source: "huggingface",
+        artifact: "model.safetensors",
+        downloadedBytes: 0,
+        totalBytes: 8,
+      });
+      options.onProgress?.({
+        model: options.model,
+        source: "huggingface",
+        artifact: "model.safetensors",
+        downloadedBytes: 4,
+        totalBytes: 8,
+      });
+      return await createArtifactResolver()(options);
     },
   };
   const model = new Model2VecEmbeddingModel(
@@ -318,6 +475,12 @@ test("Model2Vec excludes cached artifacts from overall download progress", async
     {
       stage: "downloading",
       model: "local/test-potion",
+      downloadedBytes: 0,
+      totalBytes: 8,
+    },
+    {
+      stage: "downloading",
+      model: "local/test-potion",
       downloadedBytes: 4,
       totalBytes: 8,
     },
@@ -326,7 +489,94 @@ test("Model2Vec excludes cached artifacts from overall download progress", async
       model: "local/test-potion",
     },
   ]);
+  assert.deepEqual(JSON.parse(await readFile(tokenizerConfigPath, "utf8")), {
+    tokenizer_class: "PreTrainedTokenizer",
+  });
   await model.dispose();
+});
+
+test("Model2Vec reports download failures without exposing artifact names", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-model2vec-failure-");
+  const progress = [];
+  const model = new Model2VecEmbeddingModel(
+    entry(),
+    { modelCacheDir: root },
+    {
+      async loadTokenizer() {
+        throw new Error("tokenizer should not load after a download failure");
+      },
+      async loadSafetensors() {
+        throw new Error("table should not load after a download failure");
+      },
+      async resolveArtifacts(options) {
+        options.onDownloadPlan?.(options.artifacts);
+        options.onProgress?.({
+          model: options.model,
+          source: "huggingface",
+          artifact: options.artifacts[0].path,
+          downloadedBytes: 0,
+          totalBytes: options.artifacts[0].size,
+        });
+        throw new Error("network unavailable");
+      },
+    },
+  );
+
+  let failure;
+  await assert.rejects(
+    model.embed([{ kind: "text", text: "download failure" }], {
+      onProgress: (event) => progress.push(event),
+    }),
+    (error) => {
+      failure = error;
+      return error.code === "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED";
+    },
+  );
+
+  assert.deepEqual(
+    progress.map(({ stage }) => stage),
+    ["preparing", "downloading", "warning"],
+  );
+  assert.deepEqual(progress[1], {
+    stage: "downloading",
+    model: "local/test-potion",
+    downloadedBytes: 0,
+    totalBytes: 16,
+  });
+  assert.match(progress[2].message, /network access.*model cache/i);
+  assert.doesNotMatch(
+    JSON.stringify(progress),
+    /model\.safetensors|tokenizer\.json/,
+  );
+  assert.doesNotMatch(failure.context, /model\.safetensors|tokenizer\.json/);
+});
+
+test("Model2Vec classifies table preparation errors as model load failures", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-model2vec-load-");
+  const progress = [];
+  const model = new Model2VecEmbeddingModel(
+    entry(),
+    { modelCacheDir: root },
+    {
+      async loadTokenizer() {
+        throw new Error("tokenizer should not load after a table failure");
+      },
+      async loadSafetensors() {
+        throw new Error("invalid static table");
+      },
+      resolveArtifacts: createArtifactResolver(),
+    },
+  );
+
+  await assert.rejects(
+    model.embed([{ kind: "text", text: "load failure" }], {
+      onProgress: (event) => progress.push(event),
+    }),
+    (error) =>
+      error.code === "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_LOAD_FAILED" &&
+      error.cause?.message === "invalid static table",
+  );
+  assert.equal(progress.at(-1)?.stage, "warning");
 });
 
 test("Model2Vec reports and truncates inputs beyond the model token limit", async (t) => {
@@ -352,9 +602,7 @@ test("Model2Vec reports and truncates inputs beyond the model token limit", asyn
         rows: 3,
       };
     },
-    async download(_url, destination) {
-      await writeFile(destination, "asset");
-    },
+    resolveArtifacts: createArtifactResolver(),
   };
 
   const model = new Model2VecEmbeddingModel(
@@ -397,9 +645,7 @@ test("Model2Vec rejects token ids outside the static embedding table", async (t)
         rows: 3,
       };
     },
-    async download(_url, destination) {
-      await writeFile(destination, "asset");
-    },
+    resolveArtifacts: createArtifactResolver(),
   };
 
   const model = new Model2VecEmbeddingModel(
@@ -431,8 +677,8 @@ test("Model2Vec reuses a loaded worker pool without reloading artifacts", async 
       async loadSafetensors() {
         throw new Error("worker-backed model should not reload its table");
       },
-      async download() {
-        throw new Error("worker-backed model should not download artifacts");
+      async resolveArtifacts() {
+        throw new Error("worker-backed model should not resolve artifacts");
       },
     },
   );

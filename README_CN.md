@@ -18,6 +18,11 @@
   </p>
 
   <p>
+    <a href="https://trendshift.io/repositories/200612?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-200612" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/200612/daily?language=TypeScript" alt="zvec-ai/zvec-grep | Trendshift TypeScript 日榜" width="250" height="55" /></a>
+    <a href="https://trendshift.io/repositories/200612?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-200612" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/200612/daily" alt="zvec-ai/zvec-grep | Trendshift 全语言日榜" width="250" height="55" /></a>
+  </p>
+
+  <p>
     <a href="#tour">🎬 <strong>功能演示</strong></a> |
     <a href="#features">💫 <strong>核心特性</strong></a> |
     <a href="#try-it-yourself">🚀 <strong>动手体验</strong></a> |
@@ -27,9 +32,9 @@
   </p>
 </div>
 
-**zg**（**z**vec-**g**rep）将 ripgrep、BM25 与向量检索统一在一个
-[本地优先的检索入口](./docs/05-architecture.md)中。既可以由人在终端中搜索，
-也可以让 Agent 根据问题选择合适的本地检索方式。
+**zg**（**z**vec-**g**rep），由 [zvec](https://github.com/alibaba/zvec) 驱动，
+将 ripgrep、BM25 与向量检索统一在一个[本地优先的检索入口](./docs/05-architecture.md)中。
+既可以由人在终端中搜索，也可以让 Agent 根据问题选择合适的本地检索方式。
 
 <a id="tour"></a>
 
@@ -74,6 +79,15 @@ curl --retry 3 --retry-all-errors --progress-bar -fL \
 
 zg index --embedding local/potion-retrieval-32m
 ```
+
+> [!NOTE]
+> 索引保存在被索引项目根目录的 `.zvec-grep/` 中。
+
+> [!TIP]
+> `zg index` 或 `zg query` 失败时，在原命令后加 `--debug` 重跑，查看诊断信息（direct 和 server 模式均支持）。
+> 在同一项目下，可用 `zg status --mode direct --debug` 或
+> `zg status --mode server --debug` 查看已记录的索引错误。
+> Server 连接失败时，检查 `zg server status` 和[服务日志](./docs/06-server.md#logs-and-state)。
 
 ### 2. 选择检索方式
 
@@ -130,6 +144,59 @@ zg query --human "An unseen creature left a few marks. What did the detective in
 
 zg 会将 `sherlock-holmes.txt` 中的相关段落排在
 `alice-in-wonderland.txt` 前面。
+
+### 索引 Embedding 并发与 GPU 错误
+
+`zg --index --index-embedding-concurrency <n>` 和
+`ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY` 控制构建或更新索引时的 Embedding
+并发，对本地和远程模型均生效。环境变量也适用于自动建索引和刷新；这些设置
+不影响查询文本的向量推理。
+CLI 参数仅与 `--index` 一起使用。
+
+对于 llama.cpp，上限控制索引模型实例的 context 数；对于 Transformers.js，
+控制同一缓存 pipeline 中尚未完成的调用数，不保证原生运行时或 GPU 同时执行。
+这两个后端取正整数，超过 **8** 按 8 处理。对于 Potion/model2vec，上限控制
+并发 Embedding 批次数，没有该 8 路限制；默认为 **2**，CPU worker 池还有独立
+容量上限。对于远程模型，CLI 参数和环境变量均控制并发批次数，也不额外限制为
+8；原有自适应调度及默认值保持不变，遇到限流或可重试错误时可能降低并发。
+
+优先级为：显式 CLI/API 索引参数 > 索引环境变量 >
+`ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM`（仅 llama.cpp 索引阶段）> 自动默认值。
+
+对于 llama.cpp 和 Transformers.js，未显式设置时，CPU 或没有显存查询接口的
+运行时使用 1。Transformers.js 目前没有该接口，因此自动上限为 1。
+GPU 运行时提供空闲显存时，按
+`floor(空闲显存 × 0.25 / 150 MiB)` 计算，并限制在 1–8；查询失败或返回
+无效值时使用 2。这里沿用原有的 150 MiB 启发式估算，不保证模型一定能装入显存。
+
+遇到 CUDA 错误、内存不足或原生运行时崩溃时，可将上限设为 1 后重试索引。
+以下示例使用直接执行模式，使新的环境变量立即生效：
+
+```bash
+export ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY=1
+zg --index --mode direct
+```
+
+Windows PowerShell：
+
+```powershell
+$env:ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY = "1"
+zg --index --mode direct
+```
+
+显式 CLI 参数会在本次索引操作中覆盖环境变量，使用后台服务时也会生效，
+无需为 CLI 参数重启后台服务：
+
+```bash
+export ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY=8
+zg --index --index-embedding-concurrency 1
+```
+
+若要修改后台服务的环境变量默认值，需更新其启动环境，然后在该环境中运行
+`zg --server off` 和 `zg --server on`。如果由 Agent 启动 zg，还需更新其环境并重启
+Agent/MCP 连接。JavaScript 异常可以捕获，但原生 abort 可能在 CPU 回退之前
+直接结束进程。将上限设为 1 可以降低并发，但不能避免所有 GPU 故障；也可使用
+`--device cpu` 重试。
 
 <a id="benchmarks"></a>
 
@@ -218,7 +285,7 @@ Profile 均使用 Qwen3.7 Text Embedding。
 
 | 💬 钉钉群 | 📱 微信群 | 🎮 Discord | X (Twitter) |
 | :---: | :---: | :---: | :---: |
-| <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/dingding.png" width="150" alt="钉钉二维码"/> | <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/wechat.png?v4" width="150" alt="微信二维码"/> | [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/rKddFBBu9z) | [![X (formerly Twitter) Follow](https://img.shields.io/twitter/follow/ZvecAI)](<https://x.com/ZvecAI>) |
+| <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/dingding.png" width="150" alt="钉钉二维码"/> | <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/wechat.png?v5" width="150" alt="微信二维码"/> | [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/rKddFBBu9z) | [![X (formerly Twitter) Follow](https://img.shields.io/twitter/follow/ZvecAI)](<https://x.com/ZvecAI>) |
 | 扫码加入 | 扫码加入 | 点击加入 | 点击关注 |
 
 </div>

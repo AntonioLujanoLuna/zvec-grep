@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   realpath,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -20,6 +21,8 @@ import { DaemonHttpServer } from "../dist/daemon/http-server.js";
 import { BaseEmbeddingModel } from "../dist/engine/models/embeddings.js";
 import { createZvecGrep } from "../dist/index.js";
 import { DaemonClient } from "../dist/client/daemon-client.js";
+
+import { createDaemonLogger } from "../dist/daemon/logger.js";
 
 const token = "server-http-test-token-at-least-32-characters";
 
@@ -587,9 +590,9 @@ test("Streamable HTTP indexes and searches with qwen text-embedding-v4", async (
   assert.equal(unsupported.isError, undefined);
   assert.equal(unsupported.structuredContent.state, "failed");
   assert.deepEqual(unsupported.structuredContent.error, {
-    code: "MODEL_LOAD_FAILED",
-    message:
-      "[MODEL_LOAD_FAILED] Embedding model qwen/unsupported-embedding could not be created: Embedding model is not in the zvec-grep catalog",
+    code: "ZVEC_GREP.ENGINE.MODELS.EMBEDDING_CATALOG_MODEL_NOT_FOUND",
+    message: "Embedding model is not in the zvec-grep catalog",
+    context: "embedding=qwen/unsupported-embedding",
   });
   assert.match(unsupported.content[0].text, /qwen\/unsupported-embedding/);
   const unsupportedStatus = await client.callTool({
@@ -599,7 +602,7 @@ test("Streamable HTTP indexes and searches with qwen text-embedding-v4", async (
   assert.equal(unsupportedStatus.structuredContent.indexed, false);
   assert.equal(
     unsupportedStatus.structuredContent.runtime.error.code,
-    "MODEL_LOAD_FAILED",
+    "ZVEC_GREP.ENGINE.MODELS.EMBEDDING_CATALOG_MODEL_NOT_FOUND",
   );
   await assert.rejects(access(join(unsupportedRoot, ".zvec-grep", "index")));
 });
@@ -687,4 +690,53 @@ class TestEmbeddingModel extends BaseEmbeddingModel {
       truncated: [],
     };
   }
+}
+
+for (const level of ["info", "debug"]) {
+  test(`HTTP health probes use debug logging at ${level} level`, async (t) => {
+    const home = await mkdtemp(join(tmpdir(), "zvec-grep-health-log-"));
+    const logger = createDaemonLogger(home, { level });
+    const server = new DaemonHttpServer({
+      host: "127.0.0.1",
+      port: 0,
+      version: "1.0.0",
+      backend: {},
+      logger,
+    });
+    t.after(async () => {
+      await server.close();
+      await logger.flush();
+      await rm(home, { recursive: true, force: true });
+    });
+    const { port } = await server.start();
+    for (const [path, method, status] of [
+      ["/healthz", "GET", 200],
+      ["/healthz?probe=1", "GET", 200],
+      ["/healthz", "POST", 405],
+      ["/unknown", "GET", 404],
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+      });
+      assert.equal(response.status, status);
+      await response.text();
+    }
+    await logger.flush();
+    const records = (
+      await readFile(join(home, "daemon", "logs", "server.log"), "utf8")
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(records.length, level === "debug" ? 4 : 2);
+    const probes = records.filter((record) => record.status === 200);
+    assert.equal(probes.length, level === "debug" ? 2 : 0);
+    assert.ok(probes.every((record) => record.level === "debug"));
+    assert.deepEqual(
+      records
+        .filter((record) => record.level === "info")
+        .map((record) => record.status),
+      [405, 404],
+    );
+  });
 }

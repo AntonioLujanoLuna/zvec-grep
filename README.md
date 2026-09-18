@@ -18,6 +18,11 @@
   </p>
 
   <p>
+    <a href="https://trendshift.io/repositories/200612?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-200612" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/200612/daily?language=TypeScript" alt="zvec-ai/zvec-grep | Trendshift TypeScript daily ranking" width="250" height="55" /></a>
+    <a href="https://trendshift.io/repositories/200612?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-200612" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/200612/daily" alt="zvec-ai/zvec-grep | Trendshift all-language daily ranking" width="250" height="55" /></a>
+  </p>
+
+  <p>
     <a href="#tour">🎬 <strong>Tour</strong></a> |
     <a href="#features">💫 <strong>Features</strong></a> |
     <a href="#try-it-yourself">🚀 <strong>Try it yourself</strong></a> |
@@ -27,7 +32,8 @@
   </p>
 </div>
 
-**zg** (**z**vec-**g**rep) unifies ripgrep, BM25, and vector search behind
+**zg** (**z**vec-**g**rep), powered by [zvec](https://github.com/alibaba/zvec),
+unifies ripgrep, BM25, and vector search behind
 [one local-first interface](./docs/05-architecture.md). Use it directly from the
 terminal, or let your agent use it for you.
 
@@ -74,6 +80,19 @@ curl --retry 3 --retry-all-errors --progress-bar -fL \
 
 zg index --embedding local/potion-retrieval-32m
 ```
+
+> [!NOTE]
+> The index is stored in `.zvec-grep/` under the indexed project root.
+
+> [!TIP]
+> If `zg index` or `zg query` fails, rerun the same command with `--debug`
+> for diagnostics (supported in both direct and server modes).
+> `zg status --mode direct --debug` reports per-file failures stored in an
+> existing index; rerun a failed direct command to diagnose command-level
+> fatal errors. Use
+> `zg status --mode server --debug` to inspect recorded server indexing errors.
+> For server connection failures, check `zg server status` and the
+> [server logs](./docs/06-server.md#logs-and-state).
 
 ### 2. Choose how to search
 
@@ -130,6 +149,66 @@ zg query --human "An unseen creature left a few marks. What did the detective in
 
 zg returns the relevant passages from `sherlock-holmes.txt`, ranked ahead of
 `alice-in-wonderland.txt`.
+
+### Index embedding concurrency and GPU errors
+
+`zg --index --index-embedding-concurrency <n>` and
+`ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY` control embedding concurrency while
+building or updating an index, for both local and remote models. The environment
+variable also applies to automatic indexing and refresh. These controls do not
+change query-vector inference. The CLI option is accepted only with `--index`.
+
+For llama.cpp, the limit controls contexts per indexing model instance. For
+Transformers.js, it controls calls in flight on one cached pipeline and does not
+guarantee simultaneous native/GPU execution. Both cap positive integer values
+at **8**. For Potion/model2vec, it controls concurrent embedding batches without
+that cap; the default is **2** and the CPU worker pool has its own capacity limit.
+For remote models, both controls set the maximum concurrent batches without the
+cap of 8. Existing adaptive scheduling and its defaults remain unchanged; it may
+reduce concurrency after rate limits or retryable failures.
+
+The priority is the explicit CLI/API index option, then the index environment
+variable, then `ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM` (llama.cpp indexing only),
+then the automatic default.
+
+For llama.cpp and Transformers.js, CPU execution or a runtime without a VRAM
+query uses 1 unless overridden. Transformers.js currently has no VRAM query, so
+its automatic limit is 1. When a GPU runtime provides free VRAM, the limit is
+`floor(freeVRAM × 0.25 / 150 MiB)`, clamped to 1–8; a failed or invalid VRAM
+query uses 2. This retains the existing 150 MiB heuristic, which is not a
+guarantee that a model will fit in memory.
+
+For CUDA errors, memory exhaustion, or native crashes, try a limit of 1 and
+retry the index. These examples run directly so the new environment takes
+effect immediately:
+
+```bash
+export ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY=1
+zg --index --mode direct
+```
+
+Windows PowerShell:
+
+```powershell
+$env:ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY = "1"
+zg --index --mode direct
+```
+
+An explicit CLI option overrides the environment for that index operation,
+including when using the daemon; no daemon restart is needed for the CLI option:
+
+```bash
+export ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY=8
+zg --index --index-embedding-concurrency 1
+```
+
+To change the daemon's environment-variable default, update its startup
+environment, then run `zg --server off` and `zg --server on` from that environment.
+If an agent launches zg, update its environment and restart the agent/MCP
+connection too. JavaScript exceptions can be caught, but native aborts can
+terminate the process before any CPU fallback runs. A limit of 1 reduces
+concurrency; it does not prevent every GPU failure. You can also retry with
+`--device cpu`.
 
 <a id="benchmarks"></a>
 
@@ -227,7 +306,7 @@ Embedding.
 
 | 💬 DingTalk | 📱 WeChat | 🎮 Discord | X (Twitter) |
 | :---: | :---: | :---: | :---: |
-| <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/dingding.png" width="150" alt="DingTalk QR Code"/> | <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/wechat.png?v4" width="150" alt="WeChat QR Code"/> | [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/rKddFBBu9z) | [![X (formerly Twitter) Follow](https://img.shields.io/twitter/follow/ZvecAI)](<https://x.com/ZvecAI>) |
+| <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/dingding.png" width="150" alt="DingTalk QR Code"/> | <img src="https://zvec.oss-cn-hongkong.aliyuncs.com/qrcode/wechat.png?v5" width="150" alt="WeChat QR Code"/> | [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/rKddFBBu9z) | [![X (formerly Twitter) Follow](https://img.shields.io/twitter/follow/ZvecAI)](<https://x.com/ZvecAI>) |
 | Scan to join | Scan to join | Click to join | Click to follow |
 
 </div>

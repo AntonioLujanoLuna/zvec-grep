@@ -1,8 +1,9 @@
-import { isEngineError } from "../engine/errors.js";
+import { isEngineError, redactErrorText } from "../engine/errors.js";
 import type { ColorMode } from "./types.js";
 
 export type ErrorPrintOptions = {
   color?: ColorMode;
+  debug?: boolean;
 };
 
 type ErrorTheme = {
@@ -15,13 +16,22 @@ export function printError(
   options: ErrorPrintOptions = {},
 ): void {
   const theme = createErrorTheme(options.color);
+  const downloadFailure = modelDownloadFailureMessage(error);
+  if (downloadFailure && !options.debug) {
+    console.error(`${theme.error("Error:")} ${downloadFailure}`);
+    return;
+  }
 
   if (isEngineError(error)) {
-    console.error(`${theme.error("Error:")} ${error.message}`);
+    console.error(
+      `${theme.error("Error:")} ${redactErrorText(downloadFailure ?? error.message, 512)}`,
+    );
     console.error(`${theme.label("Code:")} ${error.code}`);
     if (error.context) {
       console.error(`${theme.label("Details:")}`);
-      for (const line of formatContextLines(error.context)) {
+      for (const line of formatContextLines(
+        redactErrorText(error.context, 4_096),
+      )) {
         console.error(`  ${line}`);
       }
     }
@@ -30,12 +40,44 @@ export function printError(
   }
 
   console.error(
-    `${theme.error("Error:")} ${error instanceof Error ? error.message : String(error)}`,
+    `${theme.error("Error:")} ${redactErrorText(error instanceof Error ? error.message : String(error), 512)}`,
   );
   printCause(error, theme);
 }
 
-function formatContextLines(context: string): string[] {
+export function modelDownloadFailureMessage(
+  error: unknown,
+): string | undefined {
+  if (!error || typeof error !== "object" || !("code" in error)) {
+    return undefined;
+  }
+  const context =
+    "context" in error && typeof error.context === "string"
+      ? error.context
+      : "";
+  const downloadCode = "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED";
+  let details = context;
+  if (error.code !== downloadCode) {
+    if (error.code !== "ZVEC_GREP.ENGINE.INDEXING.FILES_FAILED") {
+      return undefined;
+    }
+    const failedReasons = context
+      .split(/\r?\n/)
+      .find((line) => line.startsWith("failedReasons="));
+    if (!failedReasons) return undefined;
+    const causeIndex = failedReasons.indexOf(`${downloadCode}:`);
+    if (causeIndex < 0) return undefined;
+    details = failedReasons.slice(causeIndex + downloadCode.length);
+  }
+  const model = details.match(
+    /(?:^|[\s(])model=(local\/[A-Za-z0-9._/-]+)/,
+  )?.[1];
+  return model
+    ? `Failed to download model "${model}".`
+    : "Failed to download model.";
+}
+
+export function formatContextLines(context: string): string[] {
   return context
     .split(/\r?\n/)
     .flatMap(formatContextLine)
@@ -82,7 +124,7 @@ function parseKeyValuePairs(line: string): { key: string; value: string }[] {
 function printCause(error: unknown, theme: ErrorTheme): void {
   const cause = errorCauseMessage(error);
   if (cause) {
-    console.error(`${theme.label("Cause:")} ${cause}`);
+    console.error(`${theme.label("Cause:")} ${redactErrorText(cause, 512)}`);
   }
 }
 
