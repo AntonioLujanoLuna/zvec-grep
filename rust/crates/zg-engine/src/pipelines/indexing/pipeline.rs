@@ -3,12 +3,13 @@ use std::{
     future::Future,
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
+use regex::Regex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use zg_host_native::{
@@ -567,7 +568,7 @@ enum PreparedCandidate {
 }
 
 type EmbeddingFuture<'context> =
-    Pin<Box<dyn Future<Output = EmbeddingBatchOutcome> + Send + 'context>>;
+    Pin<Box<dyn Future<Output = Result<EmbeddingBatchOutcome, EngineError>> + Send + 'context>>;
 
 #[expect(
     clippy::too_many_lines,
@@ -702,7 +703,7 @@ async fn index_candidates(
         if running.len() >= scheduler.task_concurrency()
             && let Some(outcome) = running.next().await
         {
-            apply_embedding_outcome(context, diff, progress_base, timings, &mut stats, outcome)?;
+            apply_embedding_outcome(context, diff, progress_base, timings, &mut stats, outcome?)?;
         }
     }
 
@@ -710,7 +711,7 @@ async fn index_candidates(
         push_embedding(&mut running, current_batch, context, Arc::clone(&scheduler));
     }
     while let Some(outcome) = running.next().await {
-        apply_embedding_outcome(context, diff, progress_base, timings, &mut stats, outcome)?;
+        apply_embedding_outcome(context, diff, progress_base, timings, &mut stats, outcome?)?;
     }
     throw_if_cancelled(context.signal.as_ref())?;
     Ok(stats)
@@ -1055,8 +1056,9 @@ async fn embed_prepared_files(
     scheduler: Arc<EmbeddingScheduler>,
     signal: Option<CancellationToken>,
     progress: Option<IndexProgressReporter>,
-) -> EmbeddingBatchOutcome {
+) -> Result<EmbeddingBatchOutcome, EngineError> {
     let started = Instant::now();
+    let remote = is_remote_model(model);
     if files.len() == 1 && files[0].fragments.len() > model.info().max_batch_size {
         let file = files.into_iter().next().expect("one prepared file");
         let outcome = match embed_file(
@@ -1072,15 +1074,22 @@ async fn embed_prepared_files(
                 file,
                 vectors: embedding.vectors,
             },
-            Err(error) => EmbeddedFileOutcome::Failed {
-                file,
-                reason: model_error_text(&error),
-            },
+            Err(error) => {
+                // A shared model failure affects every input, so the operation
+                // stops instead of recording one failure per file.
+                if classify_embedding_retry(&error, remote).fail_fast {
+                    return Err(error.into_engine_error());
+                }
+                EmbeddedFileOutcome::Failed {
+                    file,
+                    reason: model_error_text(&error),
+                }
+            }
         };
-        return EmbeddingBatchOutcome {
+        return Ok(EmbeddingBatchOutcome {
             outcomes: vec![outcome],
             duration: started.elapsed(),
-        };
+        });
     }
     let contents = files
         .iter()
@@ -1101,15 +1110,8 @@ async fn embed_prepared_files(
     .await;
     let outcomes = match result {
         Ok(embedding) => split_embedding(files, embedding),
-        Err(error) if classify_embedding_retry(&error).retryable => {
-            let reason = model_error_text(&error);
-            files
-                .into_iter()
-                .map(|file| EmbeddedFileOutcome::Failed {
-                    file,
-                    reason: reason.clone(),
-                })
-                .collect()
+        Err(error) if classify_embedding_retry(&error, remote).fail_fast => {
+            return Err(error.into_engine_error());
         }
         Err(_) => {
             let mut outcomes = Vec::with_capacity(files.len());
@@ -1127,6 +1129,9 @@ async fn embed_prepared_files(
                         file,
                         vectors: embedding.vectors,
                     }),
+                    Err(error) if classify_embedding_retry(&error, remote).fail_fast => {
+                        return Err(error.into_engine_error());
+                    }
                     Err(error) => outcomes.push(EmbeddedFileOutcome::Failed {
                         file,
                         reason: model_error_text(&error),
@@ -1136,10 +1141,10 @@ async fn embed_prepared_files(
             outcomes
         }
     };
-    EmbeddingBatchOutcome {
+    Ok(EmbeddingBatchOutcome {
         outcomes,
         duration: started.elapsed(),
-    }
+    })
 }
 
 fn split_embedding(
@@ -1228,20 +1233,23 @@ async fn embed_fragment_batch(
     signal: Option<&CancellationToken>,
     progress: Option<IndexProgressReporter>,
 ) -> Result<FragmentBatchResult, ModelError> {
+    let remote = is_remote_model(model);
     let contents = fragments
         .iter()
         .map(|fragment| fragment.embedding_content.clone())
         .collect::<Vec<_>>();
     match embed_with_retry(model, &contents, scheduler, signal, progress.clone()).await {
         Ok(embedding) => Ok(FragmentBatchResult { start, embedding }),
-        Err(error) if fragments.len() == 1 || classify_embedding_retry(&error).retryable => {
+        Err(error)
+            if fragments.len() == 1 || classify_embedding_retry(&error, remote).fail_fast =>
+        {
             Err(error)
         }
         Err(_) => {
             let mut vectors = Vec::with_capacity(fragments.len());
             let mut truncated = Vec::new();
             for (index, fragment) in fragments.iter().enumerate() {
-                let embedding = embed_with_retry(
+                let embedding = match embed_with_retry(
                     model,
                     std::slice::from_ref(&fragment.embedding_content),
                     scheduler,
@@ -1249,13 +1257,21 @@ async fn embed_fragment_batch(
                     progress.clone(),
                 )
                 .await
-                .map_err(|error| {
-                    ModelError::internal(format!(
-                        "fragment {} failed after one-by-one fallback: {}",
-                        fragment.fragment_id.as_str(),
-                        model_error_text(&error)
-                    ))
-                })?;
+                {
+                    Ok(embedding) => embedding,
+                    // A shared failure keeps its classification so the caller can
+                    // stop the operation instead of failing this fragment only.
+                    Err(error) if classify_embedding_retry(&error, remote).fail_fast => {
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        return Err(ModelError::internal(format!(
+                            "fragment {} failed after one-by-one fallback: {}",
+                            fragment.fragment_id.as_str(),
+                            model_error_text(&error)
+                        )));
+                    }
+                };
                 let Some(vector) = embedding.vectors.into_iter().next() else {
                     return Err(ModelError::internal(
                         "embedding returned no vector for a fragment",
@@ -1305,7 +1321,7 @@ async fn embed_with_retry(
                 return Ok(result);
             }
             Err(error) => {
-                let retry = classify_embedding_retry(&error);
+                let retry = classify_embedding_retry(&error, is_remote_model(model));
                 if !retry.retryable || attempt >= maximum_retry_attempts(retry) {
                     return Err(error);
                 }
@@ -1322,19 +1338,52 @@ async fn embed_with_retry(
 struct RetryClassification {
     retryable: bool,
     rate_limited: bool,
+    /// Whether the failure affects the whole model rather than one input, so the
+    /// operation stops instead of retrying per file.
+    fail_fast: bool,
     retry_after: Option<Duration>,
 }
 
-fn classify_embedding_retry(error: &ModelError) -> RetryClassification {
+/// Whether the model talks to a remote provider, matching main's check on
+/// `model.info.provider !== "local"`.
+fn is_remote_model(model: &dyn IndexEmbeddingRuntime) -> bool {
+    model.info().model.provider != "local"
+}
+
+/// Classifies an embedding failure the way main's `classifyEmbeddingRetry` does.
+///
+/// `remote` separates a remote provider, whose transport and HTTP failures are
+/// transient, from a local model, whose preparation failures affect every input.
+fn classify_embedding_retry(error: &ModelError, remote: bool) -> RetryClassification {
     let text = model_error_text(error);
     let normalized = text.to_ascii_lowercase();
     let status = number_after(&normalized, "status=");
-    let rate_limited = status == Some(429)
-        || normalized.contains("rate limit")
-        || normalized.contains("quota exceeded")
-        || normalized.contains("too many requests")
-        || normalized.contains("request rate increased too quickly");
-    let server_error = status.is_some_and(|status| (500..=599).contains(&status));
+    // Main marks transport failures with a `_REQUEST_FAILED` code; the Rust remote
+    // client reports them with the endpoint in the context and no HTTP status.
+    let request_failure = remote && status.is_none() && normalized.contains("endpoint=");
+    let rate_limited = remote
+        && (status == Some(429)
+            || [
+                "rate limit",
+                "quota exceeded",
+                "too many requests",
+                "request rate increased too quickly",
+            ]
+            .iter()
+            .any(|marker| normalized.contains(marker)));
+    let server_error = remote && status.is_some_and(|status| (500..=599).contains(&status));
+    let request_timeout = remote && status == Some(408);
+    let transient_network_failure =
+        remote && request_failure && is_transient_network_failure(&normalized);
+    let shared_local_model_failure = !remote
+        && (SHARED_LOCAL_MODEL_FAILURE_CODES.contains(&error.code())
+            || error.code() == EngineError::RESOURCE_CLOSED);
+    let remote_configuration_failure = remote
+        && (status.is_some_and(|status| matches!(status, 401 | 403 | 404))
+            || is_missing_remote_credential(&normalized));
+    let permanent_remote_model_failure = remote
+        && (normalized.contains("wrong dimension")
+            || (status == Some(400) && is_permanent_remote_model_request(&normalized)));
     let retry_after = number_after(&normalized, "retryafterms=")
         .map(Duration::from_millis)
         .or_else(|| {
@@ -1342,11 +1391,130 @@ fn classify_embedding_retry(error: &ModelError) -> RetryClassification {
                 .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
                 .map(Duration::from_secs_f64)
         });
+    let retryable = !shared_local_model_failure
+        && (rate_limited || server_error || request_timeout || transient_network_failure);
     RetryClassification {
-        retryable: rate_limited || server_error,
+        retryable,
         rate_limited,
+        fail_fast: retryable
+            || shared_local_model_failure
+            || remote_configuration_failure
+            || permanent_remote_model_failure
+            || (remote && request_failure),
         retry_after,
     }
+}
+
+/// Codes whose failure means the model itself is unusable, so retrying other
+/// files cannot help. Mirrors main's shared-local-model classes.
+const SHARED_LOCAL_MODEL_FAILURE_CODES: [&str; 3] = [
+    crate::models::MODEL2VEC_DOWNLOAD_FAILED,
+    crate::models::MODEL2VEC_LOAD_FAILED,
+    crate::models::TRANSFORMERS_JS_LOAD_FAILED,
+];
+
+/// Provider codes main treats as a permanent remote model rejection.
+const PERMANENT_REMOTE_MODEL_PROVIDER_CODES: [&str; 10] = [
+    "invalid_model",
+    "model_not_found",
+    "unsupported_model",
+    "invalid_dimension",
+    "invalid_dimensions",
+    "unsupported_dimension",
+    "unsupported_dimensions",
+    "dimension_out_of_range",
+    "invalid_embedding_dimension",
+    "unsupported_embedding_dimension",
+];
+
+/// `\b(?:EAI_AGAIN|...|TimeoutError)\b|connection (?:reset|timed out)|...`, plus
+/// the phrasing the Rust HTTP client uses for the same conditions.
+fn is_transient_network_failure(text: &str) -> bool {
+    if crate_flavored_transport_markers()
+        .iter()
+        .any(|marker| text.contains(marker))
+    {
+        return true;
+    }
+    transient_network_pattern().is_match(text)
+}
+
+fn crate_flavored_transport_markers() -> &'static [&'static str] {
+    &[
+        "connection refused",
+        "dns error",
+        "failed to lookup address information",
+        "tcp connect error",
+        "broken pipe",
+        "unexpected eof",
+        "network is unreachable",
+        "operation timed out",
+        "connection closed before message completed",
+    ]
+}
+
+fn transient_network_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"\b(?:eai_again|econnrefused|econnreset|ehostunreach|enetdown|enetunreach|enotfound|etimedout|und_err_connect_timeout|und_err_headers_timeout|und_err_socket|timeouterror)\b|connection (?:reset|timed out)|network connection (?:failed|was lost)|socket hang up|temporary failure",
+        )
+        .expect("transient network pattern must compile")
+    })
+}
+
+/// `\b(?:invalid|missing|unauthorized|forbidden)[ _-]?(?:api[ _-]?)?key\b`.
+fn is_missing_remote_credential(text: &str) -> bool {
+    missing_credential_pattern().is_match(text)
+}
+
+fn missing_credential_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"\b(?:invalid|missing|unauthorized|forbidden)[ _-]?(?:api[ _-]?)?key\b")
+            .expect("missing credential pattern must compile")
+    })
+}
+
+/// Whether a 400 response rejects the configured model permanently.
+fn is_permanent_remote_model_request(text: &str) -> bool {
+    if let Some(code) = capture_after(text, "providercode=") {
+        let normalized: String = code
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let normalized = normalized.trim_matches('_').to_ascii_lowercase();
+        if PERMANENT_REMOTE_MODEL_PROVIDER_CODES.contains(&normalized.as_str()) {
+            return true;
+        }
+    }
+    capture_after(text, "providermessage=").is_some_and(|message| {
+        permanent_remote_model_message_pattern()
+            .is_match(message.split(" zg.engine.").next().unwrap_or(message))
+    })
+}
+
+fn permanent_remote_model_message_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?:\b(?:invalid|unsupported|unknown)\b.{0,48}\bmodel\b|\bmodel\b.{0,48}\b(?:invalid|unsupported|unknown|not found|does not exist)\b|\b(?:invalid|unsupported|out of range)\b.{0,48}\bdimensions?\b|\bdimensions?\b.{0,48}\b(?:invalid|unsupported|not supported|out of range|must|should|expected|between|only supports?)\b)",
+        )
+        .expect("permanent remote model pattern must compile")
+    })
+}
+
+/// Returns the text following `marker` up to the next whitespace.
+fn capture_after<'text>(text: &'text str, marker: &str) -> Option<&'text str> {
+    let start = text.find(marker)? + marker.len();
+    let rest = &text[start..];
+    Some(rest.split_whitespace().next().unwrap_or_default())
 }
 
 fn maximum_retry_attempts(retry: RetryClassification) -> usize {
@@ -3164,5 +3332,250 @@ mod tests {
         assert_eq!(error.origin().line, origin_line);
         let invalid = map_host_error(HostError::invalid_argument("bad root"));
         assert_eq!(invalid.code(), EngineError::INVALID_ARGUMENT);
+    }
+
+    fn classification(
+        code: &'static str,
+        message: &str,
+        context: Option<&str>,
+        remote: bool,
+    ) -> RetryClassification {
+        let error = ModelError::new(code, message, context.map(str::to_owned));
+        classify_embedding_retry(&error, remote)
+    }
+
+    #[test]
+    fn classifies_transient_remote_embedding_failures() {
+        let rate_limited = classification(
+            EngineError::RESOURCE_BUSY,
+            "qwen request returned an error",
+            Some("model=text-embedding-v4 status=429 retryAfterMs=1500 providerCode=rate_limit"),
+            true,
+        );
+        assert!(rate_limited.retryable && rate_limited.rate_limited && rate_limited.fail_fast);
+        assert_eq!(rate_limited.retry_after, Some(Duration::from_millis(1500)));
+
+        let server_error = classification(
+            EngineError::INTERNAL,
+            "qwen request returned an error",
+            Some("status=503"),
+            true,
+        );
+        assert!(server_error.retryable && server_error.fail_fast);
+
+        let request_timeout = classification(
+            EngineError::DEADLINE_EXCEEDED,
+            "qwen request returned an error",
+            Some("status=408"),
+            true,
+        );
+        assert!(request_timeout.retryable && request_timeout.fail_fast);
+
+        let transport = classification(
+            EngineError::INTERNAL,
+            "embedding request failed: connection refused",
+            Some("endpoint=https://example.test timeoutMs=60000"),
+            true,
+        );
+        assert!(transport.retryable && transport.fail_fast);
+    }
+
+    #[test]
+    fn classifies_permanent_remote_embedding_failures() {
+        let unauthorized = classification(
+            EngineError::PERMISSION_DENIED,
+            "qwen request returned an error",
+            Some("status=401"),
+            true,
+        );
+        assert!(!unauthorized.retryable && unauthorized.fail_fast);
+
+        let rejected_model = classification(
+            EngineError::INVALID_ARGUMENT,
+            "qwen request returned an error",
+            Some("status=400 providerCode=invalid_model providerMessage=unknown model"),
+            true,
+        );
+        assert!(!rejected_model.retryable && rejected_model.fail_fast);
+
+        let request_specific = classification(
+            EngineError::INVALID_ARGUMENT,
+            "qwen request returned an error",
+            Some("status=400 providerCode=bad_request"),
+            true,
+        );
+        assert!(
+            !request_specific.retryable && !request_specific.fail_fast,
+            "a request-specific rejection must still fall back per file"
+        );
+    }
+
+    #[test]
+    fn classifies_shared_local_model_failures() {
+        let load_failed = classification(
+            crate::models::MODEL2VEC_LOAD_FAILED,
+            "Unable to load Model2Vec tokenizer",
+            Some("model=local/test"),
+            false,
+        );
+        assert!(!load_failed.retryable && load_failed.fail_fast);
+
+        let closed = classification(
+            EngineError::RESOURCE_CLOSED,
+            "model runtime manager is closed",
+            None,
+            false,
+        );
+        assert!(!closed.retryable && closed.fail_fast);
+
+        let content_specific = classification(
+            EngineError::INTERNAL,
+            "embedding content rejected",
+            None,
+            false,
+        );
+        assert!(
+            !content_specific.retryable && !content_specific.fail_fast,
+            "a content-specific failure must stay with its file"
+        );
+
+        let local_rate_limit_text =
+            classification(EngineError::INTERNAL, "rate limit exceeded", None, false);
+        assert!(
+            !local_rate_limit_text.retryable,
+            "rate-limit retries apply to remote providers only"
+        );
+    }
+
+    struct FailingEmbeddingModel {
+        info: EmbeddingModelInfo,
+        code: &'static str,
+        message: &'static str,
+        context: Option<&'static str>,
+    }
+
+    impl FailingEmbeddingModel {
+        fn new(
+            provider: &str,
+            code: &'static str,
+            message: &'static str,
+            context: Option<&'static str>,
+        ) -> Self {
+            Self {
+                info: EmbeddingModelInfo {
+                    model: crate::domain::model::ModelInfo {
+                        provider: provider.to_owned(),
+                        name: "test".to_owned(),
+                        endpoint: None,
+                    },
+                    dimension: 2,
+                    metric: Metric::Cosine,
+                    max_batch_size: 8,
+                    max_input_tokens: Some(64),
+                    max_image_bytes: None,
+                },
+                code,
+                message,
+                context,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl IndexEmbeddingRuntime for FailingEmbeddingModel {
+        fn info(&self) -> &EmbeddingModelInfo {
+            &self.info
+        }
+
+        fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults {
+            EmbeddingConcurrencyDefaults {
+                initial: 1,
+                maximum: 1,
+            }
+        }
+
+        async fn embed(
+            &self,
+            _contents: &[Vec<Content>],
+            _options: EmbeddingOptions,
+            _progress: Option<IndexProgressReporter>,
+        ) -> Result<EmbeddingResult, ModelError> {
+            Err(ModelError::new(
+                self.code,
+                self.message,
+                self.context.map(str::to_owned),
+            ))
+        }
+    }
+
+    fn two_file_workspace() -> (tempfile::TempDir, Workspace) {
+        let directory = tempdir().expect("temporary directory");
+        std::fs::write(directory.path().join("a.txt"), "alpha\n").expect("fixture");
+        std::fs::write(directory.path().join("b.txt"), "beta\n").expect("fixture");
+        let workspace = workspace(directory.path());
+        (directory, workspace)
+    }
+
+    #[tokio::test]
+    async fn shared_model_failure_stops_the_indexing_operation() {
+        let (_directory, workspace) = two_file_workspace();
+        let scanner = NativeScanner::default();
+        let storage = MemoryStorage::default();
+        let model = FailingEmbeddingModel::new(
+            "local",
+            crate::models::MODEL2VEC_LOAD_FAILED,
+            "Unable to load Model2Vec tokenizer",
+            Some("model=local/test"),
+        );
+        let error = index_workspace(&IndexingContext {
+            workspace_index: &workspace,
+            storage: &storage,
+            scanner: &scanner,
+            embedding_models: &[&model],
+            embedding_concurrency: Some(1),
+            on_progress: None,
+            signal: None,
+            changes: &[],
+        })
+        .await
+        .expect_err("a shared model failure must stop the operation");
+        assert_eq!(error.code(), crate::models::MODEL2VEC_LOAD_FAILED);
+        // The pass stops before it records anything, so no file carries a failure.
+        let files = storage.list_files().expect("files");
+        assert!(
+            files.iter().all(|file| file.index_status.error().is_none()),
+            "a shared model failure must not be recorded against each file"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_specific_failure_still_records_only_its_file() {
+        let (_directory, workspace) = two_file_workspace();
+        let scanner = NativeScanner::default();
+        let storage = MemoryStorage::default();
+        let model = FailingEmbeddingModel::new(
+            "local",
+            EngineError::INTERNAL,
+            "embedding content rejected",
+            None,
+        );
+        let result = index_workspace(&IndexingContext {
+            workspace_index: &workspace,
+            storage: &storage,
+            scanner: &scanner,
+            embedding_models: &[&model],
+            embedding_concurrency: Some(1),
+            on_progress: None,
+            signal: None,
+            changes: &[],
+        })
+        .await
+        .expect("indexing completes with failed files");
+        assert_eq!(result.files_failed, 2);
+        let files = storage.list_files().expect("files");
+        assert!(
+            files.iter().all(|file| file.index_status.error().is_some()),
+            "a content-specific failure must be recorded per file"
+        );
     }
 }

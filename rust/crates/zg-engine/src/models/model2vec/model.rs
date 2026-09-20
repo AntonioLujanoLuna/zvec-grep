@@ -23,6 +23,7 @@ use crate::{
         ModelProgress,
     },
     models::{
+        MODEL2VEC_DOWNLOAD_FAILED, MODEL2VEC_LOAD_FAILED,
         artifacts::publish_downloaded_file,
         catalog::Model2VecConfig,
         compute::ModelComputeRuntime,
@@ -110,7 +111,11 @@ impl Model2VecEmbeddingModel {
         if let Some(loaded) = &state.loaded {
             return Ok(Arc::clone(loaded));
         }
-        let loaded = Arc::new(self.load_model(on_progress).await?);
+        let loaded = Arc::new(
+            self.load_model(on_progress)
+                .await
+                .map_err(|error| error.relabel_preparation_failure(MODEL2VEC_LOAD_FAILED))?,
+        );
         state.loaded = Some(Arc::clone(&loaded));
         Ok(loaded)
     }
@@ -263,7 +268,7 @@ impl Model2VecEmbeddingModel {
         if let Err(cause) = result {
             let _ = fs::remove_file(&partial_path).await;
             return Err(ModelError::new(
-                crate::EngineError::STORAGE_FAILURE,
+                MODEL2VEC_DOWNLOAD_FAILED,
                 "Unable to download Model2Vec model artifact",
                 Some(format!("model={} url={url}", self.entry.reference)),
             )
@@ -781,7 +786,7 @@ mod tests {
             .await
             .expect_err("directory destination must reject publication");
 
-        assert_eq!(error.code(), crate::EngineError::STORAGE_FAILURE);
+        assert_eq!(error.code(), crate::models::MODEL2VEC_DOWNLOAD_FAILED);
         assert!(
             error
                 .cause()

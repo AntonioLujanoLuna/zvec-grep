@@ -29,6 +29,7 @@ use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    TRANSFORMERS_JS_LOAD_FAILED,
     artifacts::publish_downloaded_file,
     catalog::TransformersConfig,
     compute::ModelComputeRuntime,
@@ -159,7 +160,11 @@ impl TransformersEmbeddingModel {
         if let Some(loaded) = &*state {
             return Ok(Arc::clone(loaded));
         }
-        let loaded = Arc::new(self.load(on_progress).await?);
+        let loaded = Arc::new(
+            self.load(on_progress)
+                .await
+                .map_err(|error| error.relabel_preparation_failure(TRANSFORMERS_JS_LOAD_FAILED))?,
+        );
         *state = Some(Arc::clone(&loaded));
         Ok(loaded)
     }

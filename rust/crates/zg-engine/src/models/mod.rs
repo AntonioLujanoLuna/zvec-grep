@@ -35,6 +35,9 @@ use crate::domain::{
     model::{EmbeddingModelInfo, EmbeddingResult, ModelConfig},
 };
 pub(crate) use error::ModelError;
+pub(crate) use error::{
+    MODEL2VEC_DOWNLOAD_FAILED, MODEL2VEC_LOAD_FAILED, TRANSFORMERS_JS_LOAD_FAILED,
+};
 pub(crate) use spi::{EmbeddingConcurrencyDefaults, EmbeddingOptions, ModelProgressReporter};
 
 impl runtime::ModelRuntimeManager {

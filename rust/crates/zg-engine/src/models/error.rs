@@ -2,6 +2,16 @@ use thiserror::Error;
 
 use crate::{EngineError, ErrorSite};
 
+/// Codes for failures that affect a whole model rather than one input, matching
+/// main's shared-terminal classes (`ZVEC_GREP.ENGINE.MODELS.*` there, `ZG.ENGINE`
+/// here). The pipeline stops the indexing operation instead of retrying per file.
+pub(crate) const MODEL2VEC_DOWNLOAD_FAILED: &str = "ZG.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED";
+pub(crate) const MODEL2VEC_LOAD_FAILED: &str = "ZG.ENGINE.MODELS.MODEL2VEC_LOAD_FAILED";
+pub(crate) const TRANSFORMERS_JS_LOAD_FAILED: &str = "ZG.ENGINE.MODELS.TRANSFORMERS_JS_LOAD_FAILED";
+
+/// Prefix shared by every model preparation failure code.
+const MODEL_CODE_PREFIX: &str = "ZG.ENGINE.MODELS.";
+
 #[derive(Debug, Error)]
 #[error("{message}")]
 pub struct ModelError {
@@ -56,6 +66,19 @@ impl ModelError {
     pub(crate) fn with_cause(mut self, cause: impl std::fmt::Display) -> Self {
         self.cause = Some(cause.to_string());
         self
+    }
+
+    /// Labels a model preparation failure so the pipeline can tell a shared
+    /// failure from one caused by a single input.
+    ///
+    /// Failures that already carry a model code keep it, so a `Model2Vec` download
+    /// failure stays distinct from a load failure.
+    pub(crate) fn relabel_preparation_failure(self, code: &'static str) -> Self {
+        if self.code.starts_with(MODEL_CODE_PREFIX) {
+            self
+        } else {
+            Self { code, ..self }
+        }
     }
 
     pub(crate) fn wrap(self, message: impl Into<String>, context: Option<String>) -> Self {
