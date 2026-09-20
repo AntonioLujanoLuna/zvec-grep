@@ -197,26 +197,37 @@ Relevant code: [model catalog](crates/zg-engine/src/models/catalog.rs),
 [llama.cpp](crates/zg-engine/src/models/llama_cpp/mod.rs), and
 [artifact publication](crates/zg-engine/src/models/artifacts.rs).
 
-- `[ ]` Add pinned source revisions, artifact sizes/checksums, and Hugging Face /
-  ModelScope mappings. Verified drift against main:
-  - No ModelScope support anywhere in the workspace (`grep -ri modelscope rust/`
-    matches this checklist only). Main maps both sources for 12 models, e.g.
-    `bge-small-en-v1.5` HF `4a9a46c7…` / ModelScope `f246b360…`
-    (`src/engine/models/catalog.ts:112-124`).
-  - No sizes or checksums in the Rust catalog (`sha256`/`checksum` have no
-    matches in `crates/zg-engine/src/models/catalog.rs`). Main declares
-    `artifacts[]` with `size` and `sha256` for every local model (1-5 artifacts).
-  - GGUF URIs are unpinned: `uri: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"`
-    (`catalog.rs:143`) and the Qwen3-Embedding GGUF (`catalog.rs:154`), where
-    main appends `#<revision>` and records `cacheFile`
-    (`src/engine/models/catalog.ts`, `local/embeddinggemma-300m`). Rust therefore
-    fetches whatever the repository default revision currently is.
-  - `TransformersConfig`/`Model2VecConfig` carry a single `revision`
-    (`catalog.rs:100-128`) with no per-source mapping.
+- `[x]` Add pinned source revisions, artifact sizes/checksums, and Hugging Face /
+  ModelScope mappings. Implemented on this branch:
+  - GGUF URIs carry main's pinned revision
+    (`local/embeddinggemma-300m` is
+    `hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf#0f741b5a6585bd53aeb15cd1372c56f2a0f65e12`
+    in `catalog.rs`), and `hugging_face_url` resolves
+    `https://huggingface.co/<repository>/resolve/<revision>/<file>` instead of the
+    repository default (`models/llama_cpp/mod.rs`). A URI without a fragment still
+    resolves to `main`, and a fragment that is not a hexadecimal revision is
+    rejected rather than guessed at.
+  - Every local entry carries
+    `artifacts: &[ArtifactSpec { path, size, sha256 }]` and
+    `sources: &[ModelSource { kind, repo, revision }]` for Hugging Face and
+    ModelScope — 12 entries with 1-5 artifacts each, generated from main's
+    `catalog.ts` by `pin_catalog_artifacts.py` (audit scripts) so the values are
+    captured rather than transcribed.
+  - The catalog oracle test now asserts the recorded artifacts (size > 0, 64
+    hexadecimal characters), the 40-character source revisions, the presence of a
+    Hugging Face source, and a pinned fragment in every GGUF URI, so a missing
+    size, checksum or revision fails the suite
+    (`catalog_main_oracle.rs::local_models_pin_revisions_and_record_artifacts`).
+  - The ModelScope revision is recorded but not yet used: source selection is
+    still missing (see the next bullet).
 - `[~]` Check both source caches before networking and use the selected snapshot
-  consistently. Not applicable until B1 lands; caches are keyed per artifact name
-  and validate non-empty content only (`crates/zg-engine/src/models/model2vec/model.rs`,
-  GGUF magic check in `crates/zg-engine/src/models/llama_cpp/mod.rs`).
+  consistently. Content is now verified where the catalog records the artifact:
+  `is_verified_cached_file` requires the recorded size and SHA-256, so a
+  truncated, overwritten or substituted cache file is refetched instead of
+  trusted, and Model2Vec's progress-skip decisions use the same check
+  (`crates/zg-engine/src/models/artifacts.rs`). Still missing: source preference,
+  snapshot selection and the ModelScope fallback, since the Rust catalog records
+  one repository per source without main's snapshot layout.
 - `[ ]` Add response-header and read-idle deadlines.
   `reqwest::Client::new()` is used with no configured timeout for Model2Vec,
   Transformers, and llama.cpp downloads
@@ -225,19 +236,32 @@ Relevant code: [model catalog](crates/zg-engine/src/models/catalog.rs),
   (`models/qwen/mod.rs:302-303`), which is a total deadline rather than the
   header/read-idle pair main uses.
 - `[~]` Verify cached/downloaded artifacts, repair completion metadata, and
-  publish atomically. Publication is a temp-file rename
-  (`crates/zg-engine/src/models/artifacts.rs:21,107`); there is no completion
-  metadata repair or content verification.
+  publish atomically. Implemented on this branch: `verify_artifact` streams the
+  file and compares size and SHA-256 against the catalog entry, shared by
+  Model2Vec, Transformers and llama.cpp. A freshly downloaded artifact that does
+  not match fails with the model and artifact named
+  (`verify_downloaded_artifact`), while a cache hit that does not match is treated
+  as missing and refetched (`llama_cpp` removes the file first). Publication is
+  still a temp-file rename (`crates/zg-engine/src/models/artifacts.rs`). Still
+  missing: completion metadata repair (main's downloader writes a fingerprint
+  beside the artifacts), and main verifies downloads only — cache verification is
+  what main proposes in
+  [#155](https://github.com/zvec-ai/zvec-grep/pull/155), so this slice is ahead of
+  main there.
 - `[ ]` Coordinate downloads across processes, recover stale owners, and prevent
   an old writer from replacing a successor's artifact. No download lock or owner
   record exists in `models/`; main has a dedicated cache lock
   (`src/engine/models/artifact-cache-lock.ts`).
-- `[ ]` Refresh the main catalog oracle fixture and record its source revision.
-  Confirmed stale and, more importantly, it encodes the Rust shape rather than
-  main's: `crates/zg-engine/src/models/tests/fixtures/catalog-main-oracle.json`
-  has no `revision` fragment in `uri`, no `cacheFile`, no `sources`, and no
-  `artifacts`/`sha256` — so it agrees with the Rust catalog by construction and
-  cannot detect the drift in B1. See "Fixture and oracle health" below.
+- `[x]` Refresh the main catalog oracle fixture and record its source revision.
+  The fixture was stale exactly as suspected — the parity test passed while both
+  GGUF URIs lacked main's `#<revision>` — so it was regenerated from main's
+  `catalog.ts` with `refresh_catalog_fixture.py`, which also prints the drift it
+  corrects. Recorded drift (2 fields, plus the absent tables): both GGUF URIs
+  gained `#0f741b5a6585bd53aeb15cd1372c56f2a0f65e12` and
+  `#370f27d7550e0def9b39c1f16d3fbaa13aa67728`; 12 entries gained `artifacts` and
+  `sources`. The fixture now records main's revision per entry and is asserted
+  field-for-field, including the new tables. See "Fixture and oracle health"
+  below.
 
 ## C. Daemon publication and stdio lifetime
 
@@ -366,7 +390,7 @@ today; the last two were added with this branch and can:
 | Artifact | State |
 | --- | --- |
 | `rust/compat/cli/managed-rg-no-match.json` | One case; no recorded main revision, so it cannot tell which main behavior it was captured from. |
-| `crates/zg-engine/src/models/tests/fixtures/catalog-main-oracle.json` | 14 rows, but the row shape omits `uri#revision`, `cacheFile`, `sources` (Hugging Face + ModelScope), and `artifacts`/`size`/`sha256`, i.e. it matches the Rust catalog rather than main. |
+| `crates/zg-engine/src/models/tests/fixtures/catalog-main-oracle.json` (refreshed with this branch) | 14 rows derived from main's `catalog.ts` at the recorded revision, now including each local entry's pinned revisions, both source mappings and its `artifacts`/`size`/`sha256` tables. It caught real drift: before the refresh it agreed with Rust on unpinned GGUF URIs and carried no artifact tables. The pinning invariants are also asserted independently of the fixture. |
 | `rust/compat/redaction/cases.json` (added with this branch) | 28 cases captured from `redactErrorText` at main `b1d0ce9`, with the oracle file/function and revision recorded. Asserted by `crates/zg-engine/tests/redaction_compat.rs`; removing one redaction pass makes it fail, so this oracle can detect drift. |
 | `rust/compat/embedding-classification/cases.json` (added with this branch) | 20 cases captured from main's `classifyEmbeddingRetry` and `shouldFailFastEmbeddingError`. Each case states the same failure twice — main's model codes and context text, and the engine codes and context conventions Rust has — so both implementations are pinned to one recorded expectation. Asserted by `matches_recorded_classification_cases` in `crates/zg-engine/src/pipelines/indexing/pipeline.rs`; dropping the remote request-failure clause makes the transport case fail. |
 
@@ -405,6 +429,13 @@ where an oracle exists, a captured `compat/` fixture.
 4. **Diagnostics retention.** Carry provider status/context/cause and retry hints
    from `ModelError` through engine, daemon, MCP, CLI, and status output, with
    concise default output and full detail under debug.
+5. **B1 model pinning and artifact integrity — implemented on this branch** (the
+   work item B slice). Pinned GGUF revisions with fragment-aware URI resolution,
+   catalog artifact/source tables captured from main, streaming size and
+   checksum verification on downloads and cache hits, and a refreshed catalog
+   oracle that now detects drift. Remaining B slices, in order: response-header
+   and read-idle deadlines, completion-metadata repair, cross-process download
+   coordination, and the ModelScope fallback that the recorded revisions enable.
 
 Verification for each slice: workspace tests via `rust/scripts/check.sh`, request
 counts for permanent versus transient failures, preparation failure across
@@ -415,8 +446,11 @@ Covered on this branch: request counts for permanent (one attempt), transient
 (one plus three) and rate-limited (one plus six) failures, a shared preparation
 failure that must not be retried for the next batch, the abort/per-file split,
 one preparation per pass, no preparation for remote providers, no embedding call
-after a failed preparation, and no preparation for an unchanged workspace.
-Cancellation while a retry delay is pending is not yet asserted.
+after a failed preparation, no preparation for an unchanged workspace, pinned
+GGUF URI resolution (including unpinned and malformed revisions), and artifact
+verification for matching bytes, substituted contents, wrong sizes, missing
+files, unrecorded artifacts and mismatched downloads. Cancellation while a retry
+delay is pending is not yet asserted.
 
 ## Completion
 
