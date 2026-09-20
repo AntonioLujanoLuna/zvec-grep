@@ -100,26 +100,44 @@ Relevant code: [indexing pipeline](crates/zg-engine/src/pipelines/indexing/pipel
   and empty-fragment files are committed without embedding
   (`pipeline.rs:649-651`). The unchanged-file path and its request counts still
   need the regression that main uses.
-- `[~]` Stop scheduling on shared terminal failures. `EngineError::is_retryable()`
-  is limited to `RESOURCE_BUSY | DEADLINE_EXCEEDED`
-  (`crates/zg-engine/src/error.rs:178-180`) and the scheduler only retries what
-  that predicate allows (`crates/zg-daemon/src/job_scheduler.rs:681`), so
-  authentication/model/dimension failures are not retried at the job level. The
-  file-level fallback path does not consult it.
-- `[ ]` Classify transient failures, including HTTP 408 and network/timeouts.
-  `classify_embedding_retry` marks a failure retryable only for HTTP 429 and
-  5xx, and reads `retry-after`/`retryafterms` from the message text
-  (`crates/zg-engine/src/pipelines/indexing/pipeline.rs:1328-1350`). 408,
-  connect/TLS failures, and read timeouts are not classified. Main classifies
-  408, 429, and 5xx plus transport/timeout failures
-  (`src/engine/models/artifact-downloader.ts:77-85`).
-- `[ ]` Retry within one bounded budget without a second failed-file pass. The
-  pipeline still runs a second pass over failed files
-  (`crates/zg-engine/src/pipelines/indexing/pipeline.rs:128`).
-- `[~]` Preserve targeted fallback for request-specific content failures. Batch
-  failure falls back to single-fragment embedding
-  (`pipeline.rs:1235-1250`), and retryable batch failures are retried with a
-  bounded attempt budget (`pipeline.rs:1277-1364`).
+- `[~]` Stop scheduling on shared terminal failures. Implemented on this branch:
+  `classify_embedding_retry` now sets `fail_fast`, and the batch, per-file and
+  one-by-one decision points abort the operation instead of recording one failure
+  per file (`crates/zg-engine/src/pipelines/indexing/pipeline.rs`). Local model
+  preparation failures carry their own codes
+  (`ZG.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED`, `MODEL2VEC_LOAD_FAILED`,
+  `TRANSFORMERS_JS_LOAD_FAILED`, with `RESOURCE_CLOSED` standing in for main's
+  disposed-model state), relabelled at the two `ensure_loaded` entry points and
+  the Model2Vec download site. At the job level `EngineError::is_retryable()`
+  remains limited to `RESOURCE_BUSY | DEADLINE_EXCEEDED`
+  (`crates/zg-engine/src/error.rs:178-180`), which the scheduler consumes
+  (`crates/zg-daemon/src/job_scheduler.rs:681`).
+- `[~]` Classify transient failures, including HTTP 408 and network/timeouts.
+  Implemented on this branch: `classify_embedding_retry` covers 429 (including
+  rate-limit wording and `retry-after`/`retryafterms`), 5xx, 408, and transport
+  failures, which the Rust remote client reports as an endpoint context without a
+  status where main uses a `_REQUEST_FAILED` code. Permanent classes are carried
+  too: 401/403/404 and missing-credential wording, a rejected model or dimension
+  (main's provider-code set and provider-message patterns), and a local vector
+  dimension mismatch. The retry budget keeps main's numbers (3 transient / 6
+  rate-limited attempts, 500 ms and 2 s base delays, jitter, `retry-after`
+  override). Classification expectations in the tests were derived by reading
+  `classifyEmbeddingRetry`; unlike the redaction cases there is no captured
+  fixture for them yet.
+- `[x]` One bounded budget, and no shared failure reaching the second pass.
+  Main retries failed files in a second pass on purpose
+  (`src/engine/pipeline/indexing/index.ts:250-268`, "retried failed files once
+  automatically"), so the Rust pass loop matches it
+  (`crates/zg-engine/src/pipelines/indexing/pipeline.rs:117-145`). The earlier
+  wording of this item implied the second pass should disappear; with fail-fast
+  classification in place, the shared failures that made it wasteful no longer
+  reach it.
+- `[x]` Preserve targeted fallback for request-specific content failures. Batch
+  failure still falls back to single-fragment embedding, and a fail-fast error
+  inside the fallback is now rethrown with its original classification instead of
+  being wrapped as an internal failure, matching main's
+  `shouldFailFastEmbeddingError` checks
+  (`crates/zg-engine/src/pipelines/indexing/pipeline.rs`, `embed_fragment_batch`).
 - `[~]` Preserve cancellation behavior and check cancellation before model
   initialization. `check_cancelled` guards the per-item loops in Model2Vec
   (`crates/zg-engine/src/models/model2vec/model.rs:485,497,554`) and llama.cpp
@@ -348,11 +366,13 @@ where an oracle exists, a captured `compat/` fixture.
    `compat/redaction/cases.json`. Remaining: decide the upstream PR scope (helper
    plus call sites plus fixture) and whether the daemon should also redact reply
    bodies rather than relying on the CLI layer, as main does.
-2. **Transient-failure classification.** Teach `classify_embedding_retry`
-   (`crates/zg-engine/src/pipelines/indexing/pipeline.rs:1328-1350`) HTTP 408
-   and transport/timeout/read-error cases, keeping 429/5xx and `retry-after`
-   behavior, and remove the second failed-file pass in favor of one bounded
-   budget.
+2. **Transient-failure classification — implemented on this branch.**
+   `classify_embedding_retry` gained 408, transport, permanent-remote and
+   shared-local classes plus the `fail_fast` flag, and the pass now stops on
+   shared failures instead of recording them per file. Remaining: capture the
+   classification expectations as a fixture the way `compat/redaction` does, and
+   re-run the failure-path regressions main uses (request counts for permanent
+   versus transient failures, cancellation, and empty or unchanged input).
 3. **Single preparation per operation.** Add an explicit model preparation step
    before embedding dispatch so a failed initialization is not re-attempted per
    queued item (main's #81/#150 behavior), while keeping the lazy handle design
