@@ -1494,10 +1494,17 @@ fn is_permanent_remote_model_request(text: &str) -> bool {
             return true;
         }
     }
-    capture_after(text, "providermessage=").is_some_and(|message| {
+    provider_message(text).is_some_and(|message| {
         permanent_remote_model_message_pattern()
             .is_match(message.split(" zg.engine.").next().unwrap_or(message))
     })
+}
+
+/// Returns the provider message, which may span several words.
+fn provider_message(text: &str) -> Option<&str> {
+    let marker = "providermessage=";
+    let start = text.find(marker)? + marker.len();
+    Some(&text[start..])
 }
 
 fn permanent_remote_model_message_pattern() -> &'static Regex {
@@ -3452,6 +3459,7 @@ mod tests {
         code: &'static str,
         message: &'static str,
         context: Option<&'static str>,
+        calls: AtomicUsize,
     }
 
     impl FailingEmbeddingModel {
@@ -3477,7 +3485,17 @@ mod tests {
                 code,
                 message,
                 context,
+                calls: AtomicUsize::new(0),
             }
+        }
+
+        fn with_batch_size(mut self, max_batch_size: usize) -> Self {
+            self.info.max_batch_size = max_batch_size;
+            self
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Acquire)
         }
     }
 
@@ -3500,6 +3518,7 @@ mod tests {
             _options: EmbeddingOptions,
             _progress: Option<IndexProgressReporter>,
         ) -> Result<EmbeddingResult, ModelError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
             Err(ModelError::new(
                 self.code,
                 self.message,
@@ -3509,10 +3528,28 @@ mod tests {
     }
 
     fn two_file_workspace() -> (tempfile::TempDir, Workspace) {
+        two_file_workspace_with("local")
+    }
+
+    fn two_file_workspace_with(provider: &str) -> (tempfile::TempDir, Workspace) {
         let directory = tempdir().expect("temporary directory");
         std::fs::write(directory.path().join("a.txt"), "alpha\n").expect("fixture");
         std::fs::write(directory.path().join("b.txt"), "beta\n").expect("fixture");
-        let workspace = workspace(directory.path());
+        let mut workspace = workspace(directory.path());
+        // The workspace descriptor must name the same model the runtime provides.
+        workspace.index =
+            crate::domain::IndexState::Enabled(IndexDescriptor::single(EmbeddingModelInfo {
+                model: crate::domain::model::ModelInfo {
+                    provider: provider.to_owned(),
+                    name: "test".to_owned(),
+                    endpoint: None,
+                },
+                dimension: 2,
+                metric: Metric::Cosine,
+                max_batch_size: 32,
+                max_input_tokens: Some(64),
+                max_image_bytes: None,
+            }));
         (directory, workspace)
     }
 
@@ -3576,6 +3613,170 @@ mod tests {
         assert!(
             files.iter().all(|file| file.index_status.error().is_some()),
             "a content-specific failure must be recorded per file"
+        );
+    }
+
+    /// Classification cases captured from main's `classifyEmbeddingRetry` and
+    /// `shouldFailFastEmbeddingError`; the fixture records both implementations'
+    /// idioms, so a failing case is a parity finding rather than a test to adjust.
+    const CLASSIFICATION_CASES: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../compat/embedding-classification/cases.json"
+    ));
+
+    #[test]
+    fn matches_recorded_classification_cases() {
+        let fixture: serde_json::Value = serde_json::from_str(CLASSIFICATION_CASES)
+            .expect("classification fixture must be valid JSON");
+        let cases = fixture["cases"]
+            .as_array()
+            .expect("classification fixture must list cases");
+        assert!(
+            !cases.is_empty(),
+            "classification fixture must not be empty"
+        );
+
+        for case in cases {
+            let id = case["id"].as_str().expect("case must set an id");
+            let rust = &case["rust"];
+            let expected = &case["expected"];
+            let code: &'static str = Box::leak(
+                rust["code"]
+                    .as_str()
+                    .expect("case must set a rust code")
+                    .to_owned()
+                    .into_boxed_str(),
+            );
+            let message = rust["message"].as_str().expect("case must set a message");
+            let context = rust["context"].as_str().map(str::to_owned);
+            let remote = rust["remote"].as_bool().expect("case must set remote");
+            let classification =
+                classify_embedding_retry(&ModelError::new(code, message, context), remote);
+
+            assert_eq!(
+                classification.retryable,
+                expected["retryable"].as_bool().expect("retryable"),
+                "{id}: retryable"
+            );
+            assert_eq!(
+                classification.rate_limited,
+                expected["rateLimited"].as_bool().expect("rateLimited"),
+                "{id}: rateLimited"
+            );
+            assert_eq!(
+                classification.fail_fast,
+                expected["failFast"].as_bool().expect("failFast"),
+                "{id}: failFast"
+            );
+            assert_eq!(
+                classification.retry_after,
+                expected["retryAfterMs"].as_u64().map(Duration::from_millis),
+                "{id}: retryAfterMs"
+            );
+        }
+    }
+
+    async fn index_with_failing_model(
+        workspace: &Workspace,
+        storage: &MemoryStorage,
+        model: &FailingEmbeddingModel,
+    ) -> Result<IndexResult, EngineError> {
+        let scanner = NativeScanner::default();
+        index_workspace(&IndexingContext {
+            workspace_index: workspace,
+            storage,
+            scanner: &scanner,
+            embedding_models: &[model],
+            embedding_concurrency: Some(1),
+            on_progress: None,
+            signal: None,
+            changes: &[],
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn permanent_remote_failure_is_attempted_once() {
+        let (_directory, workspace) = two_file_workspace_with("qwen");
+        let storage = MemoryStorage::default();
+        let model = FailingEmbeddingModel::new(
+            "qwen",
+            EngineError::PERMISSION_DENIED,
+            "qwen request returned an error",
+            Some("status=401"),
+        );
+        let error = index_with_failing_model(&workspace, &storage, &model)
+            .await
+            .expect_err("a rejected credential stops the operation");
+        assert_eq!(error.code(), EngineError::PERMISSION_DENIED);
+        assert_eq!(
+            model.calls(),
+            1,
+            "a permanent remote failure must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_remote_failure_retries_within_the_budget() {
+        let (_directory, workspace) = two_file_workspace_with("qwen");
+        let storage = MemoryStorage::default();
+        let model = FailingEmbeddingModel::new(
+            "qwen",
+            EngineError::INTERNAL,
+            "qwen request returned an error",
+            Some("status=503 retryAfterMs=0"),
+        );
+        let error = index_with_failing_model(&workspace, &storage, &model)
+            .await
+            .expect_err("a persistent server error stops the operation");
+        assert_eq!(error.code(), EngineError::INTERNAL);
+        assert_eq!(
+            model.calls(),
+            4,
+            "transient failures get one attempt plus three retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_failure_uses_the_rate_limit_budget() {
+        let (_directory, workspace) = two_file_workspace_with("qwen");
+        let storage = MemoryStorage::default();
+        let model = FailingEmbeddingModel::new(
+            "qwen",
+            EngineError::RESOURCE_BUSY,
+            "qwen request returned an error",
+            Some("status=429 retryAfterMs=0 providerCode=rate_limit"),
+        );
+        let error = index_with_failing_model(&workspace, &storage, &model)
+            .await
+            .expect_err("a persistent rate limit stops the operation");
+        assert_eq!(error.code(), EngineError::RESOURCE_BUSY);
+        assert_eq!(
+            model.calls(),
+            7,
+            "rate limiting gets one attempt plus six retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_preparation_failure_is_not_retried_per_batch() {
+        let (_directory, workspace) = two_file_workspace();
+        let storage = MemoryStorage::default();
+        let model = FailingEmbeddingModel::new(
+            "local",
+            crate::models::MODEL2VEC_DOWNLOAD_FAILED,
+            "Unable to download Model2Vec model artifact",
+            Some("model=local/test"),
+        )
+        .with_batch_size(1);
+        let error = index_with_failing_model(&workspace, &storage, &model)
+            .await
+            .expect_err("a shared preparation failure stops the operation");
+        assert_eq!(error.code(), crate::models::MODEL2VEC_DOWNLOAD_FAILED);
+        assert_eq!(
+            model.calls(),
+            1,
+            "a shared preparation failure must not be retried for the next batch"
         );
     }
 }

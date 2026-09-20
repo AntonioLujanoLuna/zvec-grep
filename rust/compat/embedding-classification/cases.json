@@ -1,0 +1,435 @@
+{
+  "oracle": {
+    "implementation": "typescript",
+    "file": "src/engine/pipeline/indexing/index.ts",
+    "functions": [
+      "classifyEmbeddingRetry",
+      "shouldFailFastEmbeddingError"
+    ],
+    "mainCommit": "b1d0ce9a83448f90db4d5fdb17faae7a2f01a790",
+    "capturedAt": "2026-09-20",
+    "notes": "Each case carries the same failure in both implementations' idioms: the TypeScript half uses main's model codes, the Rust half uses the engine codes and context conventions Rust has. `expected.failFast` was captured from shouldFailFastEmbeddingError, which is the predicate main uses at the same decision points. Inputs are synthetic."
+  },
+  "cases": [
+    {
+      "id": "remote-rate-limited",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_API_ERROR",
+        "message": "qwen request returned an error",
+        "context": "model=text-embedding-v4 status=429 retryAfterMs=1500 providerCode=rate_limit"
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.RESOURCE_BUSY",
+        "message": "qwen request returned an error",
+        "context": "model=text-embedding-v4 status=429 retryAfterMs=1500 providerCode=rate_limit"
+      },
+      "expected": {
+        "retryable": true,
+        "rateLimited": true,
+        "failFast": true,
+        "retryAfterMs": 1500
+      }
+    },
+    {
+      "id": "remote-rate-limit-wording-without-status",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_API_ERROR",
+        "message": "provider request rate increased too quickly",
+        "context": null
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.RESOURCE_BUSY",
+        "message": "provider request rate increased too quickly",
+        "context": null
+      },
+      "expected": {
+        "retryable": true,
+        "rateLimited": true,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "remote-server-error",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_API_ERROR",
+        "message": "qwen request returned an error",
+        "context": "status=503"
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.INTERNAL",
+        "message": "qwen request returned an error",
+        "context": "status=503"
+      },
+      "expected": {
+        "retryable": true,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "remote-request-timeout",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_API_ERROR",
+        "message": "qwen request returned an error",
+        "context": "status=408"
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.DEADLINE_EXCEEDED",
+        "message": "qwen request returned an error",
+        "context": "status=408"
+      },
+      "expected": {
+        "retryable": true,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "remote-transport-failure",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_REQUEST_FAILED",
+        "message": "socket hang up",
+        "context": "endpoint=https://example.test"
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.INTERNAL",
+        "message": "embedding request failed: connection refused",
+        "context": "endpoint=https://example.test timeoutMs=60000"
+      },
+      "expected": {
+        "retryable": true,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "remote-transport-failure-without-network-marker",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_REQUEST_FAILED",
+        "message": "request failed",
+        "context": "endpoint=https://example.test"
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.INTERNAL",
+        "message": "request failed",
+        "context": "endpoint=https://example.test"
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "remote-unauthorized",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_API_ERROR",
+        "message": "qwen request returned an error",
+        "context": "status=401"
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.PERMISSION_DENIED",
+        "message": "qwen request returned an error",
+        "context": "status=401"
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "remote-not-found",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_API_ERROR",
+        "message": "qwen request returned an error",
+        "context": "status=404"
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.NOT_FOUND",
+        "message": "qwen request returned an error",
+        "context": "status=404"
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "remote-missing-api-key",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_MISSING_API_KEY",
+        "message": "an api key is required",
+        "context": null
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.PERMISSION_DENIED",
+        "message": "missing api key for the configured endpoint",
+        "context": null
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "remote-invalid-model-provider-code",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_API_ERROR",
+        "message": "qwen request returned an error",
+        "context": "status=400 providerCode=invalid_model providerMessage=unknown model"
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.INVALID_ARGUMENT",
+        "message": "qwen request returned an error",
+        "context": "status=400 providerCode=invalid_model providerMessage=unknown model"
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "remote-invalid-model-provider-message",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_API_ERROR",
+        "message": "qwen request returned an error",
+        "context": "status=400 providerCode=unknown providerMessage=the configured model does not exist"
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.INVALID_ARGUMENT",
+        "message": "qwen request returned an error",
+        "context": "status=400 providerCode=unknown providerMessage=the configured model does not exist"
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "remote-request-specific-bad-request",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.QWEN_TEXT_EMBEDDING_V4_API_ERROR",
+        "message": "qwen request returned an error",
+        "context": "status=400 providerCode=bad_request providerMessage=input too long"
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.INVALID_ARGUMENT",
+        "message": "qwen request returned an error",
+        "context": "status=400 providerCode=bad_request providerMessage=input too long"
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": false,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "remote-dimension-mismatch",
+      "typescript": {
+        "provider": "qwen",
+        "code": "ZVEC_GREP.ENGINE.MODELS.EMBEDDING_DIMENSION_MISMATCH",
+        "message": "provider returned 512 dimensions, expected 1024",
+        "context": null
+      },
+      "rust": {
+        "remote": true,
+        "code": "ZG.ENGINE.INVALID_ARGUMENT",
+        "message": "Embedding model returned a vector with the wrong dimension",
+        "context": "expected=1024 actual=512"
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "local-content-failure",
+      "typescript": {
+        "provider": "local",
+        "code": "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_EMBED_FAILED",
+        "message": "Model2Vec tokenization failed",
+        "context": null
+      },
+      "rust": {
+        "remote": false,
+        "code": "ZG.ENGINE.INTERNAL",
+        "message": "embedding content rejected",
+        "context": null
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": false,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "local-download-failure",
+      "typescript": {
+        "provider": "local",
+        "code": "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED",
+        "message": "Unable to download Model2Vec model artifact",
+        "context": null
+      },
+      "rust": {
+        "remote": false,
+        "code": "ZG.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED",
+        "message": "Unable to download Model2Vec model artifact",
+        "context": null
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "local-load-failure",
+      "typescript": {
+        "provider": "local",
+        "code": "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_LOAD_FAILED",
+        "message": "Unable to load Model2Vec tokenizer",
+        "context": null
+      },
+      "rust": {
+        "remote": false,
+        "code": "ZG.ENGINE.MODELS.MODEL2VEC_LOAD_FAILED",
+        "message": "Unable to load Model2Vec tokenizer",
+        "context": null
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "local-disposed-model",
+      "typescript": {
+        "provider": "local",
+        "code": "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DISPOSED",
+        "message": "the model was disposed",
+        "context": null
+      },
+      "rust": {
+        "remote": false,
+        "code": "ZG.ENGINE.RESOURCE_CLOSED",
+        "message": "model runtime manager is closed",
+        "context": null
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "local-transformers-load-failure",
+      "typescript": {
+        "provider": "local",
+        "code": "ZVEC_GREP.ENGINE.MODELS.TRANSFORMERS_JS_LOAD_FAILED",
+        "message": "Unable to load Transformers.js model",
+        "context": null
+      },
+      "rust": {
+        "remote": false,
+        "code": "ZG.ENGINE.MODELS.TRANSFORMERS_JS_LOAD_FAILED",
+        "message": "Unable to load Transformers.js model",
+        "context": null
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "local-rate-limit-wording",
+      "typescript": {
+        "provider": "local",
+        "code": "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_EMBED_FAILED",
+        "message": "rate limit exceeded",
+        "context": null
+      },
+      "rust": {
+        "remote": false,
+        "code": "ZG.ENGINE.INTERNAL",
+        "message": "rate limit exceeded",
+        "context": null
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": false,
+        "retryAfterMs": null
+      }
+    },
+    {
+      "id": "local-failure-behind-shared-local-code-supersedes-retry",
+      "typescript": {
+        "provider": "local",
+        "code": "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_LOAD_FAILED",
+        "message": "tokenizer load failed after status=503",
+        "context": "status=503"
+      },
+      "rust": {
+        "remote": false,
+        "code": "ZG.ENGINE.MODELS.MODEL2VEC_LOAD_FAILED",
+        "message": "tokenizer load failed after status=503",
+        "context": "status=503"
+      },
+      "expected": {
+        "retryable": false,
+        "rateLimited": false,
+        "failFast": true,
+        "retryAfterMs": null
+      }
+    }
+  ]
+}
