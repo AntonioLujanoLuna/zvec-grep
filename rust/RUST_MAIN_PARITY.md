@@ -87,19 +87,38 @@ Relevant code: [indexing pipeline](crates/zg-engine/src/pipelines/indexing/pipel
 [job scheduler](crates/zg-daemon/src/job_scheduler.rs),
 [CLI entry point](crates/zg/src/main.rs), and [rendering](crates/zg-cli/src/render.rs).
 
-- `[ ]` Prepare required models once before dispatching embedding work.
-  `ModelRuntimeManager::acquire_impl` constructs the model handle under the
-  manager lock and the code comment states the design intent: *"Backends load
-  heavy resources lazily, so this guarantees a single instance without blocking
-  on I/O"* (`crates/zg-engine/src/models/runtime.rs:157-166`). There is no
-  `prepare`/`ensure_ready` equivalent on the model SPI or the runtime manager
-  (no matches for `prepare`, `ensure_ready`, `initialize`, `warm`).
-- `[~]` Keep unchanged and empty-content operations free of unnecessary model
+- `[x]` Prepare required models once before dispatching embedding work.
+  Implemented on this branch and matching main's `EmbeddingModel.prepare?`
+  (`src/engine/models/embeddings.ts:67-73`, called once per pass at
+  `src/engine/pipeline/indexing/index.ts:738-805`):
+
+  - the model SPI gained `prepare` with a default no-op
+    (`crates/zg-engine/src/models/spi.rs`), so remote providers need nothing and
+    Rust mirrors main's optional hook;
+  - `Model2VecEmbeddingModel` implements it as `ensure_loaded` with cancellation
+    checked before and after (`crates/zg-engine/src/models/model2vec/model.rs`),
+    which is the only backend main implements it for;
+  - the lease forwards model progress to the indexing reporter
+    (`crates/zg-engine/src/models/runtime.rs`, `attach_progress`, shared with
+    `embed`);
+  - the pass prepares once, lazily, when the first batch is queued
+    (`prepare_embedding_model` behind `push_embedding`), so a failed preparation
+    aborts before any batch is queued and is not re-attempted per batch.
+
+  Accepted difference from #150: main's Transformers backend surfaces a cached
+  terminal initialization failure because transformers.js keeps its first session
+  promise even on rejection. Rust's backends cache nothing beyond the pass, so a
+  later operation retries initialization. The batch-level abort is what prevents
+  redundant retries within one operation, and the earlier note about
+  "local handles load lazily" still holds for the handle itself
+  (`crates/zg-engine/src/models/runtime.rs:157-166`).
+- `[x]` Keep unchanged and empty-content operations free of unnecessary model
   downloads or loading. Invalid globs and unsupported sources are rejected before
   model acquisition (`crates/zg-engine/src/pipelines/indexing/service.rs:196`),
-  and empty-fragment files are committed without embedding
-  (`pipeline.rs:649-651`). The unchanged-file path and its request counts still
-  need the regression that main uses.
+  empty-fragment files are committed without embedding (`pipeline.rs:649-651`),
+  and preparation is lazy — an unchanged workspace queues no batch, so the model
+  is neither prepared nor loaded. Covered by
+  `unchanged_workspace_does_not_prepare_the_model_again`.
 - `[~]` Stop scheduling on shared terminal failures. Implemented on this branch:
   `classify_embedding_retry` now sets `fail_fast`, and the batch, per-file and
   one-by-one decision points abort the operation instead of recording one failure
@@ -378,10 +397,11 @@ where an oracle exists, a captured `compat/` fixture.
    request-count regressions are covered by tests. Remaining: explicit
    cancellation coverage while a retry delay is pending, and re-capturing the
    cases whenever main's classification changes.
-3. **Single preparation per operation.** Add an explicit model preparation step
-   before embedding dispatch so a failed initialization is not re-attempted per
-   queued item (main's #81/#150 behavior), while keeping the lazy handle design
-   in `crates/zg-engine/src/models/runtime.rs:157-166` for resource lifetime.
+3. **Single preparation per operation — implemented on this branch.** The SPI's
+   optional `prepare`, Model2Vec's implementation, lease progress forwarding, and
+   the once-per-pass gate before the first batch. Remaining: decide whether the
+   Transformers backend should keep a terminal initialization failure the way
+   main's library does, or stay recoverable as it is now.
 4. **Diagnostics retention.** Carry provider status/context/cause and retry hints
    from `ModelError` through engine, daemon, MCP, CLI, and status output, with
    concise default output and full detail under debug.
@@ -393,9 +413,10 @@ diagnostic preservation/redaction.
 
 Covered on this branch: request counts for permanent (one attempt), transient
 (one plus three) and rate-limited (one plus six) failures, a shared preparation
-failure that must not be retried for the next batch, and the abort/per-file
-split. Empty and unchanged input are covered by the existing pass tests;
-cancellation while a retry delay is pending is not yet asserted.
+failure that must not be retried for the next batch, the abort/per-file split,
+one preparation per pass, no preparation for remote providers, no embedding call
+after a failed preparation, and no preparation for an unchanged workspace.
+Cancellation while a retry delay is pending is not yet asserted.
 
 ## Completion
 
