@@ -121,9 +121,12 @@ Relevant code: [indexing pipeline](crates/zg-engine/src/pipelines/indexing/pipel
   (main's provider-code set and provider-message patterns), and a local vector
   dimension mismatch. The retry budget keeps main's numbers (3 transient / 6
   rate-limited attempts, 500 ms and 2 s base delays, jitter, `retry-after`
-  override). Classification expectations in the tests were derived by reading
-  `classifyEmbeddingRetry`; unlike the redaction cases there is no captured
-  fixture for them yet.
+  override). The classification expectations are captured in
+  `compat/embedding-classification/cases.json` and asserted case by case, so the
+  fixture fails when a class is dropped rather than only when a hand-written
+  expectation drifts. Main separates a transport failure (`_REQUEST_FAILED`, no
+  status) from a provider error response (`_API_ERROR`, with status); the fixture
+  records both so the Rust mapping is pinned too.
 - `[x]` One bounded budget, and no shared failure reaching the second pass.
   Main retries failed files in a second pass on purpose
   (`src/engine/pipeline/indexing/index.ts:250-268`, "retried failed files once
@@ -338,14 +341,15 @@ Relevant code: [Rust CI workflow](../.github/workflows/rust-ci.yml).
 
 ## Fixture and oracle health
 
-Three oracle artifacts are recorded. The first two cannot detect drift from main
-today; the third was added with this branch and can:
+Four oracle artifacts are recorded. The first two cannot detect drift from main
+today; the last two were added with this branch and can:
 
 | Artifact | State |
 | --- | --- |
 | `rust/compat/cli/managed-rg-no-match.json` | One case; no recorded main revision, so it cannot tell which main behavior it was captured from. |
 | `crates/zg-engine/src/models/tests/fixtures/catalog-main-oracle.json` | 14 rows, but the row shape omits `uri#revision`, `cacheFile`, `sources` (Hugging Face + ModelScope), and `artifacts`/`size`/`sha256`, i.e. it matches the Rust catalog rather than main. |
 | `rust/compat/redaction/cases.json` (added with this branch) | 28 cases captured from `redactErrorText` at main `b1d0ce9`, with the oracle file/function and revision recorded. Asserted by `crates/zg-engine/tests/redaction_compat.rs`; removing one redaction pass makes it fail, so this oracle can detect drift. |
+| `rust/compat/embedding-classification/cases.json` (added with this branch) | 20 cases captured from main's `classifyEmbeddingRetry` and `shouldFailFastEmbeddingError`. Each case states the same failure twice — main's model codes and context text, and the engine codes and context conventions Rust has — so both implementations are pinned to one recorded expectation. Asserted by `matches_recorded_classification_cases` in `crates/zg-engine/src/pipelines/indexing/pipeline.rs`; dropping the remote request-failure clause makes the transport case fail. |
 
 Catalog comparison method used here (kept for reuse):
 `/home/ubuntu/zvec-grep-audit/catalog_diff.py` and `fixture_diff.py` parse
@@ -369,10 +373,11 @@ where an oracle exists, a captured `compat/` fixture.
 2. **Transient-failure classification — implemented on this branch.**
    `classify_embedding_retry` gained 408, transport, permanent-remote and
    shared-local classes plus the `fail_fast` flag, and the pass now stops on
-   shared failures instead of recording them per file. Remaining: capture the
-   classification expectations as a fixture the way `compat/redaction` does, and
-   re-run the failure-path regressions main uses (request counts for permanent
-   versus transient failures, cancellation, and empty or unchanged input).
+   shared failures instead of recording them per file. The expectations are
+   captured in `compat/embedding-classification/cases.json` (20 cases), and the
+   request-count regressions are covered by tests. Remaining: explicit
+   cancellation coverage while a retry delay is pending, and re-capturing the
+   cases whenever main's classification changes.
 3. **Single preparation per operation.** Add an explicit model preparation step
    before embedding dispatch so a failed initialization is not re-attempted per
    queued item (main's #81/#150 behavior), while keeping the lazy handle design
@@ -385,6 +390,12 @@ Verification for each slice: workspace tests via `rust/scripts/check.sh`, reques
 counts for permanent versus transient failures, preparation failure across
 multiple batches, cancellation and recovery, empty/unchanged input, and
 diagnostic preservation/redaction.
+
+Covered on this branch: request counts for permanent (one attempt), transient
+(one plus three) and rate-limited (one plus six) failures, a shared preparation
+failure that must not be retried for the next batch, and the abort/per-file
+split. Empty and unchanged input are covered by the existing pass tests;
+cancellation while a retry delay is pending is not yet asserted.
 
 ## Completion
 
