@@ -27,7 +27,7 @@ use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    artifacts::publish_downloaded_file,
+    artifacts::{is_verified_cached_file, publish_downloaded_file, verify_downloaded_artifact},
     catalog::LlamaCppConfig,
     compute::ModelComputeRuntime,
     download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},
@@ -224,10 +224,16 @@ impl LlamaCppEmbeddingModel {
                     .with_cause(error)
             })?;
         let destination = self.model_cache_dir.join(cache_file_name(self.entry.uri));
-        if is_file(&destination).await {
+        let cached = is_file(&destination).await;
+        if cached && is_verified_cached_file(&destination, self.entry.artifacts).await {
             reporter.skip(artifact);
             validate_gguf_file(&destination, self.entry.uri).await?;
             return Ok(destination);
+        }
+        if cached {
+            // A cached artifact that does not match the recorded bytes is treated
+            // as missing: the download below replaces it.
+            let _ = fs::remove_file(&destination).await;
         }
 
         let url = hugging_face_url(self.entry.uri)?;
@@ -247,6 +253,13 @@ impl LlamaCppEmbeddingModel {
                     .with_cause(error),
             );
         }
+        verify_downloaded_artifact(
+            &destination,
+            self.entry.artifacts,
+            self.entry.reference,
+            artifact,
+        )
+        .await?;
         validate_gguf_file(&destination, self.entry.uri).await?;
         Ok(destination)
     }
@@ -892,25 +905,60 @@ fn check_cancelled(signal: Option<&CancellationToken>) -> Result<(), ModelError>
     Ok(())
 }
 
-fn hugging_face_url(uri: &str) -> Result<String, ModelError> {
+/// Splits a catalog URI into its repository path, file name and pinned revision.
+///
+/// Catalog URIs are `hf:<owner>/<repository>/<file>[#<revision>]`, mirroring
+/// main's `uri` values, where the fragment pins the revision the artifact was
+/// recorded from.
+fn split_model_uri(uri: &str) -> Result<(&str, &str, Option<&str>), ModelError> {
     let model = uri.strip_prefix("hf:").ok_or_else(|| {
         ModelError::unsupported(format!("Unsupported llama.cpp model URI: {uri}"))
     })?;
-    let (repository, file) = model.rsplit_once('/').ok_or_else(|| {
+    let (path, revision) = match model.rsplit_once('#') {
+        Some((path, revision)) => {
+            // Catalog revisions are git SHAs: a short one is allowed, anything
+            // that is not hexadecimal is a typo rather than a revision.
+            if revision.len() < 7 || !revision.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ModelError::invalid_argument(format!(
+                    "Invalid llama.cpp model revision in URI: {uri}"
+                )));
+            }
+            (path, Some(revision))
+        }
+        None => (model, None),
+    };
+    let (repository, file) = path.rsplit_once('/').ok_or_else(|| {
         ModelError::invalid_argument(format!("Invalid Hugging Face llama.cpp model URI: {uri}"))
     })?;
+    if repository.is_empty()
+        || file.is_empty()
+        || repository.split('/').any(str::is_empty)
+        || file.contains('/')
+    {
+        return Err(ModelError::invalid_argument(format!(
+            "Invalid Hugging Face llama.cpp model URI: {uri}"
+        )));
+    }
+    Ok((repository, file, revision))
+}
+
+fn hugging_face_url(uri: &str) -> Result<String, ModelError> {
+    let (repository, file, revision) = split_model_uri(uri)?;
+    let revision = revision.unwrap_or("main");
     Ok(format!(
-        "https://huggingface.co/{repository}/resolve/main/{file}"
+        "https://huggingface.co/{repository}/resolve/{revision}/{file}"
     ))
 }
 
 fn gguf_artifact_name(uri: &str) -> Result<&str, ModelError> {
-    uri.rsplit_once('/')
-        .map(|(_, file)| file)
-        .ok_or_else(|| ModelError::invalid_argument(format!("Invalid llama.cpp model URI: {uri}")))
+    split_model_uri(uri).map(|(_, file, _)| file)
 }
 
 fn cache_file_name(uri: &str) -> String {
+    if let Ok((repository, file, _)) = split_model_uri(uri) {
+        let owner = repository.split('/').next().unwrap_or_default();
+        return format!("hf_{owner}_{file}");
+    }
     let without_scheme = uri.strip_prefix("hf:").unwrap_or(uri);
     let owner = without_scheme.split('/').next().unwrap_or_default();
     let file = without_scheme.rsplit('/').next().unwrap_or(without_scheme);
@@ -1017,12 +1065,55 @@ mod tests {
         let uri = entry("local/embeddinggemma-300m").uri;
         assert_eq!(
             hugging_face_url(uri).expect("HF URL"),
-            "https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf"
+            "https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/\
+             0f741b5a6585bd53aeb15cd1372c56f2a0f65e12/embeddinggemma-300M-Q8_0.gguf"
         );
         assert_eq!(
             cache_file_name(uri),
             "hf_ggml-org_embeddinggemma-300M-Q8_0.gguf"
         );
+        assert_eq!(
+            gguf_artifact_name(uri).expect("artifact name"),
+            "embeddinggemma-300M-Q8_0.gguf"
+        );
+    }
+
+    #[test]
+    fn unpinned_uri_resolves_to_the_default_revision() {
+        assert_eq!(
+            hugging_face_url("hf:owner/repository/model.gguf").expect("HF URL"),
+            "https://huggingface.co/owner/repository/resolve/main/model.gguf"
+        );
+        assert_eq!(
+            cache_file_name("hf:owner/repository/model.gguf"),
+            "hf_owner_model.gguf"
+        );
+    }
+
+    #[test]
+    fn short_hex_revision_resolves_to_that_revision() {
+        assert_eq!(
+            hugging_face_url("hf:owner/repository/model.gguf#0f741b5").expect("HF URL"),
+            "https://huggingface.co/owner/repository/resolve/0f741b5/model.gguf"
+        );
+    }
+
+    #[test]
+    fn malformed_uris_are_rejected_without_guessing_a_revision() {
+        for uri in [
+            "hf:owner/repository/model.gguf#",
+            "hf:owner/repository/model.gguf#notarevision",
+            "hf:owner/repository/model.gguf#0f741b",
+            "hf:model.gguf",
+            "hf:owner//model.gguf",
+            "hf:owner/repository/",
+            "https://example.invalid/model.gguf",
+        ] {
+            assert!(
+                hugging_face_url(uri).is_err(),
+                "{uri} must not resolve to a download URL"
+            );
+        }
     }
 
     #[test]

@@ -1,8 +1,138 @@
-//! Publication of downloaded model cache artifacts.
+//! Publication and verification of downloaded model cache artifacts.
 
-use std::{fs, io, path::Path};
+use std::{fs, io, io::Read, path::Path};
 
-use crate::{EngineError, EngineResult, utils::sync_directory};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    EngineError, EngineResult,
+    models::{catalog::ArtifactSpec, error::ModelError},
+    utils::sync_directory,
+};
+
+/// Bytes hashed per read while verifying an artifact.
+const VERIFY_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Returns whether a cached artifact exists and matches its catalog entry.
+///
+/// Artifacts without a catalog entry (files a backend synthesises locally) only
+/// have to be non-empty. A present but unverifiable artifact is reported as
+/// missing so the caller refetches it, which is how a truncated or substituted
+/// cache file is recovered from.
+pub(super) async fn is_verified_cached_file(path: &Path, specs: &[ArtifactSpec]) -> bool {
+    if !is_non_empty_file(path).await {
+        return false;
+    }
+    match artifact_spec(specs, path) {
+        Some(spec) => verify_artifact(path, spec).await.is_ok(),
+        None => true,
+    }
+}
+
+/// Verifies a freshly downloaded artifact, demanding the recorded bytes.
+///
+/// A mismatch here is a source or transport fault rather than a stale cache, so
+/// it fails loudly instead of publishing the file; the caller removes it.
+pub(super) async fn verify_downloaded_artifact(
+    path: &Path,
+    specs: &[ArtifactSpec],
+    model: &str,
+    artifact: &str,
+) -> Result<(), ModelError> {
+    let Some(spec) = artifact_spec(specs, path) else {
+        return Ok(());
+    };
+    if let Err(error) = verify_artifact(path, spec).await {
+        return Err(ModelError::new(
+            EngineError::STORAGE_FAILURE,
+            "Model artifact failed its integrity check",
+            Some(format!("model={model} artifact={artifact}")),
+        )
+        .with_cause(error));
+    }
+    Ok(())
+}
+
+async fn is_non_empty_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+}
+
+/// Returns the catalog entry for a cached artifact, matched by file name.
+///
+/// Catalog paths may include a directory (for example `onnx/model_q4.onnx`), so
+/// both the full path and its final segment are considered.
+pub(super) fn artifact_spec<'spec>(
+    specs: &'spec [ArtifactSpec],
+    path: &Path,
+) -> Option<&'spec ArtifactSpec> {
+    let name = path.file_name()?.to_str()?;
+    specs.iter().find(|spec| {
+        spec.path == name || spec.path.rsplit_once('/').map(|(_, file)| file) == Some(name)
+    })
+}
+
+/// Verifies a cached or freshly downloaded artifact against its catalog entry.
+///
+/// Mirrors main's integrity check: the recorded size and SHA-256 must both match,
+/// so a truncated, overwritten or substituted cache file cannot be used as a
+/// model. The file is hashed in chunks, keeping memory flat for multi-hundred
+/// megabyte artifacts.
+pub(super) async fn verify_artifact(path: &Path, spec: &ArtifactSpec) -> EngineResult<()> {
+    let path = path.to_path_buf();
+    let spec = *spec;
+    tokio::task::spawn_blocking(move || verify_artifact_sync(&path, &spec))
+        .await
+        .map_err(|error| {
+            EngineError::internal(format!("artifact verification task failed: {error}"))
+        })?
+}
+
+fn verify_artifact_sync(path: &Path, spec: &ArtifactSpec) -> EngineResult<()> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        EngineError::from_io(
+            format!("Unable to inspect model artifact '{}'", path.display()),
+            &error,
+        )
+    })?;
+    let actual_size = metadata.len();
+    let mismatch = |actual_sha256: &str| {
+        EngineError::internal(format!(
+            "Integrity check failed for '{}': expected {} bytes/{} received {} bytes/{}",
+            spec.path, spec.size, spec.sha256, actual_size, actual_sha256
+        ))
+    };
+    if actual_size != spec.size {
+        return Err(mismatch("unread"));
+    }
+
+    let mut file = fs::File::open(path).map_err(|error| {
+        EngineError::from_io(
+            format!("Unable to read model artifact '{}'", path.display()),
+            &error,
+        )
+    })?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; VERIFY_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            EngineError::from_io(
+                format!("Unable to read model artifact '{}'", path.display()),
+                &error,
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let actual_sha256 = hex::encode(digest.finalize());
+    if !actual_sha256.eq_ignore_ascii_case(spec.sha256) {
+        return Err(mismatch(&actual_sha256));
+    }
+    Ok(())
+}
 
 /// Publishes a downloaded model artifact and syncs its file and cache directory.
 ///
@@ -221,5 +351,100 @@ mod tests {
             );
         }
         assert_entries(root.path(), &["other", "record", "record.part"]);
+    }
+
+    /// `sha256("abc")`, the payload the verification tests write.
+    const DIGEST_OF_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn spec() -> ArtifactSpec {
+        ArtifactSpec {
+            path: "onnx/model_q4.onnx",
+            size: 3,
+            sha256: DIGEST_OF_ABC,
+        }
+    }
+
+    #[test]
+    fn records_are_matched_by_path_or_file_name() {
+        let specs = [spec()];
+        assert_eq!(
+            artifact_spec(&specs, Path::new("onnx/model_q4.onnx")).map(|spec| spec.path),
+            Some("onnx/model_q4.onnx")
+        );
+        assert_eq!(
+            artifact_spec(&specs, Path::new("/cache/models/model_q4.onnx")).map(|spec| spec.path),
+            Some("onnx/model_q4.onnx")
+        );
+        assert!(artifact_spec(&specs, Path::new("/cache/models/other.onnx")).is_none());
+    }
+
+    #[tokio::test]
+    async fn artifact_matching_the_recorded_bytes_verifies() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let path = root.path().join("model_q4.onnx");
+        fs::write(&path, b"abc").expect("artifact contents");
+        verify_artifact(&path, &spec())
+            .await
+            .expect("recorded bytes must verify");
+        assert!(is_verified_cached_file(&path, &[spec()]).await);
+    }
+
+    #[tokio::test]
+    async fn artifact_with_other_contents_reports_both_checksums() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let path = root.path().join("model_q4.onnx");
+        fs::write(&path, b"abd").expect("artifact contents");
+        let error = verify_artifact(&path, &spec())
+            .await
+            .expect_err("substituted contents must not verify");
+        assert!(
+            error.message().contains("Integrity check failed"),
+            "{error}"
+        );
+        assert!(error.message().contains(DIGEST_OF_ABC), "{error}");
+        assert!(!is_verified_cached_file(&path, &[spec()]).await);
+    }
+
+    #[tokio::test]
+    async fn artifact_with_other_size_reports_the_expected_size() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let path = root.path().join("model_q4.onnx");
+        fs::write(&path, b"abcd").expect("artifact contents");
+        let error = verify_artifact(&path, &spec())
+            .await
+            .expect_err("truncated or extended contents must not verify");
+        assert!(error.message().contains("expected 3 bytes"), "{error}");
+        assert!(error.message().contains("received 4 bytes"), "{error}");
+        assert!(!is_verified_cached_file(&path, &[spec()]).await);
+    }
+
+    #[tokio::test]
+    async fn artifacts_without_a_record_only_have_to_be_present() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let synthesised = root.path().join("tokenizer_config.json");
+        fs::write(
+            &synthesised,
+            b"{\"tokenizer_class\":\"PreTrainedTokenizer\"}",
+        )
+        .expect("contents");
+        assert!(is_verified_cached_file(&synthesised, &[spec()]).await);
+        assert!(!is_verified_cached_file(&root.path().join("missing.json"), &[spec()]).await);
+        let empty = root.path().join("empty.json");
+        fs::write(&empty, b"").expect("empty contents");
+        assert!(!is_verified_cached_file(&empty, &[]).await);
+    }
+
+    #[tokio::test]
+    async fn downloaded_artifact_failure_names_the_model_and_artifact() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let path = root.path().join("model_q4.onnx");
+        fs::write(&path, b"abd").expect("artifact contents");
+        let error = verify_downloaded_artifact(&path, &[spec()], "local/test", "model_q4.onnx")
+            .await
+            .expect_err("mismatched download must fail");
+        assert_eq!(error.code(), EngineError::STORAGE_FAILURE);
+        let context = error.context().unwrap_or_default();
+        assert!(context.contains("model=local/test"), "{context}");
+        assert!(context.contains("artifact=model_q4.onnx"), "{context}");
     }
 }

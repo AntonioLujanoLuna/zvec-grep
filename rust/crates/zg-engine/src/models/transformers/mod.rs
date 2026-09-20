@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     TRANSFORMERS_JS_LOAD_FAILED,
-    artifacts::publish_downloaded_file,
+    artifacts::{is_verified_cached_file, publish_downloaded_file, verify_downloaded_artifact},
     catalog::TransformersConfig,
     compute::ModelComputeRuntime,
     download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},
@@ -240,7 +240,7 @@ impl TransformersEmbeddingModel {
         destination: &Path,
         reporter: &ModelDownloadProgressReporter,
     ) -> Result<PathBuf, ModelError> {
-        if usable_file(destination).await {
+        if is_verified_cached_file(destination, self.entry.artifacts).await {
             reporter.skip(artifact);
             return Ok(destination.to_path_buf());
         }
@@ -264,7 +264,7 @@ impl TransformersEmbeddingModel {
         destination: &Path,
         reporter: &ModelDownloadProgressReporter,
     ) -> Result<Option<PathBuf>, ModelError> {
-        if usable_file(destination).await {
+        if is_verified_cached_file(destination, self.entry.artifacts).await {
             reporter.skip(artifact);
             return Ok(Some(destination.to_path_buf()));
         }
@@ -350,6 +350,17 @@ impl TransformersEmbeddingModel {
             return Err(ModelError::storage_failure(
                 "Downloaded model artifact is empty",
             ));
+        }
+        if let Err(error) = verify_downloaded_artifact(
+            &partial,
+            self.entry.artifacts,
+            self.entry.reference,
+            artifact,
+        )
+        .await
+        {
+            let _ = fs::remove_file(&partial).await;
+            return Err(error);
         }
         if let Err(error) = publish_downloaded_file(&partial, destination).await {
             let _ = fs::remove_file(&partial).await;
@@ -1525,6 +1536,8 @@ mod tests {
             document_prefix: Some("passage: "),
             max_input_tokens: 2,
             max_batch_size: 4,
+            artifacts: &[],
+            sources: &[],
         }
     }
 

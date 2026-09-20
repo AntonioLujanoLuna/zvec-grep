@@ -24,7 +24,7 @@ use crate::{
     },
     models::{
         MODEL2VEC_DOWNLOAD_FAILED, MODEL2VEC_LOAD_FAILED,
-        artifacts::publish_downloaded_file,
+        artifacts::{is_verified_cached_file, publish_downloaded_file, verify_downloaded_artifact},
         catalog::Model2VecConfig,
         compute::ModelComputeRuntime,
         download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},
@@ -159,7 +159,12 @@ impl Model2VecEmbeddingModel {
         reporter: &ModelDownloadProgressReporter,
     ) -> Result<(), ModelError> {
         let model_artifact = file_name(self.entry.model_file)?;
-        if is_usable_model_file(&self.model_directory().join(model_artifact)).await {
+        if is_verified_cached_file(
+            &self.model_directory().join(model_artifact),
+            self.entry.artifacts,
+        )
+        .await
+        {
             reporter.skip(model_artifact);
         }
 
@@ -168,7 +173,7 @@ impl Model2VecEmbeddingModel {
             .model_directory()
             .join("tokenizer")
             .join("tokenizer.json");
-        if is_usable_model_file(&tokenizer_path).await {
+        if is_verified_cached_file(&tokenizer_path, self.entry.artifacts).await {
             reporter.skip(tokenizer_artifact);
         }
         Ok(())
@@ -223,7 +228,7 @@ impl Model2VecEmbeddingModel {
         reporter: &ModelDownloadProgressReporter,
     ) -> Result<PathBuf, ModelError> {
         let artifact = file_name(remote_file)?;
-        if is_usable_model_file(local_path).await {
+        if is_verified_cached_file(local_path, self.entry.artifacts).await {
             reporter.skip(artifact);
             return Ok(local_path.to_path_buf());
         }
@@ -252,13 +257,23 @@ impl Model2VecEmbeddingModel {
             .await;
         let result = match result {
             Ok(()) if is_usable_model_file(&partial_path).await => {
-                publish_downloaded_file(&partial_path, local_path)
-                    .await
-                    .map_err(|error| {
-                        ModelError::storage_failure(format!(
-                            "Unable to publish Model2Vec artifact: {error}"
-                        ))
-                    })
+                match verify_downloaded_artifact(
+                    &partial_path,
+                    self.entry.artifacts,
+                    self.entry.reference,
+                    artifact,
+                )
+                .await
+                {
+                    Ok(()) => publish_downloaded_file(&partial_path, local_path)
+                        .await
+                        .map_err(|error| {
+                            ModelError::storage_failure(format!(
+                                "Unable to publish Model2Vec artifact: {error}"
+                            ))
+                        }),
+                    Err(error) => Err(error),
+                }
             }
             Ok(()) => Err(ModelError::storage_failure(
                 "Downloaded model file is empty",
@@ -1063,6 +1078,8 @@ mod tests {
             default_concurrency: 2,
             query_prefix: Some("query: "),
             document_prefix: Some("passage: "),
+            artifacts: &[],
+            sources: &[],
         }
     }
 
