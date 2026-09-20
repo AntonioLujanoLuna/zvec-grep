@@ -13,7 +13,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use ort::{
     session::{
         Session,
@@ -33,6 +32,7 @@ use super::{
     artifacts::{is_verified_cached_file, publish_downloaded_file, verify_downloaded_artifact},
     catalog::TransformersConfig,
     compute::ModelComputeRuntime,
+    download::DOWNLOAD_TIMEOUTS,
     download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},
     spi::{
         EmbeddingModel, EmbeddingOptions, ModelError, input_text, validate_inputs, validate_result,
@@ -269,10 +269,8 @@ impl TransformersEmbeddingModel {
             return Ok(Some(destination.to_path_buf()));
         }
         let url = self.artifact_url(artifact);
-        let exists = self
-            .client
-            .head(&url)
-            .send()
+        let exists = DOWNLOAD_TIMEOUTS
+            .send(&url, self.client.head(&url))
             .await
             .is_ok_and(|response| response.status().is_success());
         if !exists {
@@ -307,10 +305,8 @@ impl TransformersEmbeddingModel {
                 .with_cause(error)
         })?;
         let partial = partial_path(destination);
-        let response = self
-            .client
-            .get(url)
-            .send()
+        let response = DOWNLOAD_TIMEOUTS
+            .send(url, self.client.get(url))
             .await
             .map_err(|error| ModelError::storage_failure(error.to_string()))?;
         if !response.status().is_success() {
@@ -326,8 +322,11 @@ impl TransformersEmbeddingModel {
         })?;
         let mut downloaded_bytes = 0_u64;
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| ModelError::storage_failure(error.to_string()))?;
+        while let Some(chunk) = DOWNLOAD_TIMEOUTS
+            .next_chunk(&mut stream, url)
+            .await
+            .map_err(|error| ModelError::storage_failure(error.to_string()))?
+        {
             file.write_all(&chunk).await.map_err(|error| {
                 ModelError::storage_failure("Unable to write Transformers artifact")
                     .with_cause(error)

@@ -10,7 +10,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
@@ -27,6 +26,7 @@ use crate::{
         artifacts::{is_verified_cached_file, publish_downloaded_file, verify_downloaded_artifact},
         catalog::Model2VecConfig,
         compute::ModelComputeRuntime,
+        download::DOWNLOAD_TIMEOUTS,
         download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},
         spi::{
             EmbeddingConcurrencyDefaults, EmbeddingModel, EmbeddingOptions, ModelError, input_text,
@@ -443,10 +443,8 @@ impl Model2VecDependencies for DefaultModel2VecDependencies {
         destination: &Path,
         on_progress: Arc<dyn Fn(ArtifactDownloadProgress) + Send + Sync>,
     ) -> Result<(), ModelError> {
-        let response = self
-            .client
-            .get(url)
-            .send()
+        let response = DOWNLOAD_TIMEOUTS
+            .send(url, self.client.get(url))
             .await
             .map_err(|error| ModelError::storage_failure(error.to_string()))?;
         if !response.status().is_success() {
@@ -461,8 +459,11 @@ impl Model2VecDependencies for DefaultModel2VecDependencies {
         })?;
         let mut downloaded_bytes = 0_u64;
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| ModelError::storage_failure(error.to_string()))?;
+        while let Some(chunk) = DOWNLOAD_TIMEOUTS
+            .next_chunk(&mut stream, url)
+            .await
+            .map_err(|error| ModelError::storage_failure(error.to_string()))?
+        {
             file.write_all(&chunk).await.map_err(|error| {
                 ModelError::storage_failure(format!("Unable to write model artifact: {error}"))
             })?;

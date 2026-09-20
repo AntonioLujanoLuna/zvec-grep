@@ -13,7 +13,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use llama_cpp_2::{
     LlamaBackendDevice, LlamaBackendDeviceType,
     context::{LlamaContext, params::LlamaContextParams},
@@ -30,6 +29,7 @@ use super::{
     artifacts::{is_verified_cached_file, publish_downloaded_file, verify_downloaded_artifact},
     catalog::LlamaCppConfig,
     compute::ModelComputeRuntime,
+    download::DOWNLOAD_TIMEOUTS,
     download_progress::{ArtifactDownloadProgress, ModelDownloadProgressReporter},
     spi::{
         EmbeddingModel, EmbeddingOptions, ModelError, input_text, validate_inputs, validate_result,
@@ -271,10 +271,13 @@ impl LlamaCppEmbeddingModel {
         artifact: &str,
         reporter: &ModelDownloadProgressReporter,
     ) -> Result<(), ModelError> {
-        let response = self.client.get(url).send().await.map_err(|error| {
-            ModelError::storage_failure("Unable to request llama.cpp model artifact")
-                .with_cause(error)
-        })?;
+        let response = DOWNLOAD_TIMEOUTS
+            .send(url, self.client.get(url))
+            .await
+            .map_err(|error| {
+                ModelError::storage_failure("Unable to request llama.cpp model artifact")
+                    .with_cause(error)
+            })?;
         if !response.status().is_success() {
             return Err(ModelError::storage_failure(format!(
                 "Unable to download llama.cpp model artifact: HTTP {}",
@@ -288,11 +291,14 @@ impl LlamaCppEmbeddingModel {
         })?;
         let mut downloaded_bytes = 0_u64;
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| {
+        while let Some(chunk) = DOWNLOAD_TIMEOUTS
+            .next_chunk(&mut stream, url)
+            .await
+            .map_err(|error| {
                 ModelError::storage_failure("Unable to read llama.cpp model download")
                     .with_cause(error)
-            })?;
+            })?
+        {
             output.write_all(&chunk).await.map_err(|error| {
                 ModelError::storage_failure("Unable to write llama.cpp model download")
                     .with_cause(error)

@@ -10,6 +10,7 @@ mod spi;
 // Runtime and artifact management.
 mod artifacts;
 mod compute;
+mod download;
 mod download_progress;
 mod runtime;
 
