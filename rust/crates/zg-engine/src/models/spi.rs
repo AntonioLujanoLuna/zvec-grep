@@ -111,6 +111,16 @@ pub trait EmbeddingModel: Send + Sync {
         inputs: &[Vec<Content>],
         options: EmbeddingOptions,
     ) -> Result<EmbeddingResult, ModelError>;
+
+    /// Prepares local resources before indexing queues any embedding batch.
+    ///
+    /// Remote providers keep this default: they hold no local resources and open
+    /// their connection per request. Local backends load their artifacts here so a
+    /// failed initialization is not re-attempted for every queued batch, and so a
+    /// later operation can recover when the environment has changed.
+    async fn prepare(&self, _options: EmbeddingOptions) -> Result<(), ModelError> {
+        Ok(())
+    }
 }
 
 pub(crate) fn validate_inputs(

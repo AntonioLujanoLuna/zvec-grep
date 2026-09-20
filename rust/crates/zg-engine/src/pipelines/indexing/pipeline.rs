@@ -72,6 +72,18 @@ pub(crate) trait IndexEmbeddingRuntime: Send + Sync {
         options: EmbeddingOptions,
         progress: Option<IndexProgressReporter>,
     ) -> Result<EmbeddingResult, ModelError>;
+
+    /// Loads local artifacts once before any embedding batch is queued.
+    ///
+    /// Remote providers keep this default because they hold no local artifacts;
+    /// only local backends override it.
+    async fn prepare(
+        &self,
+        _options: EmbeddingOptions,
+        _progress: Option<IndexProgressReporter>,
+    ) -> Result<(), ModelError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -91,6 +103,15 @@ impl IndexEmbeddingRuntime for ModelRuntimeLease {
         progress: Option<IndexProgressReporter>,
     ) -> Result<EmbeddingResult, ModelError> {
         self.embed(contents, options, progress.map(model_progress::for_index))
+            .await
+    }
+
+    async fn prepare(
+        &self,
+        options: EmbeddingOptions,
+        progress: Option<IndexProgressReporter>,
+    ) -> Result<(), ModelError> {
+        self.prepare(options, progress.map(model_progress::for_index))
             .await
     }
 }
@@ -590,6 +611,8 @@ async fn index_candidates(
     let mut stats = IndexWriteStats::default();
     let mut current_batch = Vec::new();
     let mut current_fragments = 0;
+    // Local artifacts are loaded once per pass, before the first batch is queued.
+    let mut model_prepared = false;
     let mut running: FuturesUnordered<EmbeddingFuture<'_>> = FuturesUnordered::new();
 
     report_indexing(
@@ -666,7 +689,9 @@ async fn index_candidates(
                     std::mem::take(&mut current_batch),
                     context,
                     Arc::clone(&scheduler),
-                );
+                    &mut model_prepared,
+                )
+                .await?;
                 current_fragments = 0;
             }
             push_embedding(
@@ -674,7 +699,9 @@ async fn index_candidates(
                 vec![prepared],
                 context,
                 Arc::clone(&scheduler),
-            );
+                &mut model_prepared,
+            )
+            .await?;
         } else {
             if current_fragments > 0
                 && current_fragments + prepared.fragments.len() > max_batch_size
@@ -684,7 +711,9 @@ async fn index_candidates(
                     std::mem::take(&mut current_batch),
                     context,
                     Arc::clone(&scheduler),
-                );
+                    &mut model_prepared,
+                )
+                .await?;
                 current_fragments = 0;
             }
             current_fragments += prepared.fragments.len();
@@ -695,7 +724,9 @@ async fn index_candidates(
                     std::mem::take(&mut current_batch),
                     context,
                     Arc::clone(&scheduler),
-                );
+                    &mut model_prepared,
+                )
+                .await?;
                 current_fragments = 0;
             }
         }
@@ -708,7 +739,14 @@ async fn index_candidates(
     }
 
     if !current_batch.is_empty() {
-        push_embedding(&mut running, current_batch, context, Arc::clone(&scheduler));
+        push_embedding(
+            &mut running,
+            current_batch,
+            context,
+            Arc::clone(&scheduler),
+            &mut model_prepared,
+        )
+        .await?;
     }
     while let Some(outcome) = running.next().await {
         apply_embedding_outcome(context, diff, progress_base, timings, &mut stats, outcome?)?;
@@ -717,12 +755,44 @@ async fn index_candidates(
     Ok(stats)
 }
 
-fn push_embedding<'context>(
+/// Loads a local model once per pass, before the first batch is queued.
+///
+/// Remote providers are skipped: they hold no local artifacts. A failed
+/// preparation aborts the pass, so it is not re-attempted for every batch, and a
+/// later operation retries it because nothing is cached beyond the pass.
+async fn prepare_embedding_model(
+    context: &IndexingContext<'_>,
+    prepared: &mut bool,
+) -> Result<(), EngineError> {
+    if *prepared {
+        return Ok(());
+    }
+    for model in context.embedding_models {
+        if is_remote_model(*model) {
+            continue;
+        }
+        let options = EmbeddingOptions {
+            purpose: EmbeddingPurpose::Document,
+            signal: context.signal.clone(),
+            ..EmbeddingOptions::default()
+        };
+        model
+            .prepare(options, context.on_progress.clone())
+            .await
+            .map_err(ModelError::into_engine_error)?;
+    }
+    *prepared = true;
+    Ok(())
+}
+
+async fn push_embedding<'context>(
     running: &mut FuturesUnordered<EmbeddingFuture<'context>>,
     files: Vec<PreparedFile>,
     context: &'context IndexingContext<'context>,
     scheduler: Arc<EmbeddingScheduler>,
-) {
+    prepared: &mut bool,
+) -> Result<(), EngineError> {
+    prepare_embedding_model(context, prepared).await?;
     running.push(Box::pin(embed_prepared_files(
         files,
         context.embedding_models[0],
@@ -730,6 +800,7 @@ fn push_embedding<'context>(
         context.signal.clone(),
         context.on_progress.clone(),
     )));
+    Ok(())
 }
 
 fn apply_embedding_outcome(
@@ -3778,5 +3849,185 @@ mod tests {
             1,
             "a shared preparation failure must not be retried for the next batch"
         );
+    }
+
+    struct PreparingEmbeddingModel {
+        info: EmbeddingModelInfo,
+        prepares: AtomicUsize,
+        embeds: AtomicUsize,
+        prepare_failure: Option<(&'static str, &'static str)>,
+    }
+
+    impl PreparingEmbeddingModel {
+        fn new(provider: &str) -> Self {
+            Self {
+                info: EmbeddingModelInfo {
+                    model: crate::domain::model::ModelInfo {
+                        provider: provider.to_owned(),
+                        name: "test".to_owned(),
+                        endpoint: None,
+                    },
+                    dimension: 2,
+                    metric: Metric::Cosine,
+                    max_batch_size: 1,
+                    max_input_tokens: Some(64),
+                    max_image_bytes: None,
+                },
+                prepares: AtomicUsize::new(0),
+                embeds: AtomicUsize::new(0),
+                prepare_failure: None,
+            }
+        }
+
+        fn failing_preparation(provider: &str, code: &'static str, message: &'static str) -> Self {
+            Self {
+                prepare_failure: Some((code, message)),
+                ..Self::new(provider)
+            }
+        }
+
+        fn prepares(&self) -> usize {
+            self.prepares.load(Ordering::Acquire)
+        }
+
+        fn embeds(&self) -> usize {
+            self.embeds.load(Ordering::Acquire)
+        }
+    }
+
+    #[async_trait]
+    impl IndexEmbeddingRuntime for PreparingEmbeddingModel {
+        fn info(&self) -> &EmbeddingModelInfo {
+            &self.info
+        }
+
+        fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults {
+            EmbeddingConcurrencyDefaults {
+                initial: 1,
+                maximum: 1,
+            }
+        }
+
+        async fn prepare(
+            &self,
+            _options: EmbeddingOptions,
+            _progress: Option<IndexProgressReporter>,
+        ) -> Result<(), ModelError> {
+            self.prepares.fetch_add(1, Ordering::AcqRel);
+            match self.prepare_failure {
+                Some((code, message)) => Err(ModelError::new(code, message, None)),
+                None => Ok(()),
+            }
+        }
+
+        async fn embed(
+            &self,
+            contents: &[Vec<Content>],
+            _options: EmbeddingOptions,
+            _progress: Option<IndexProgressReporter>,
+        ) -> Result<EmbeddingResult, ModelError> {
+            self.embeds.fetch_add(1, Ordering::AcqRel);
+            Ok(EmbeddingResult {
+                vectors: contents.iter().map(|_| vec![1.0, 0.0]).collect(),
+                truncated: Vec::new(),
+            })
+        }
+    }
+
+    async fn index_with_preparing_model(
+        workspace: &Workspace,
+        storage: &MemoryStorage,
+        model: &PreparingEmbeddingModel,
+    ) -> Result<IndexResult, EngineError> {
+        let scanner = NativeScanner::default();
+        index_workspace(&IndexingContext {
+            workspace_index: workspace,
+            storage,
+            scanner: &scanner,
+            embedding_models: &[model],
+            embedding_concurrency: Some(1),
+            on_progress: None,
+            signal: None,
+            changes: &[],
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn local_model_is_prepared_once_per_pass() {
+        let (_directory, workspace) = two_file_workspace();
+        let storage = MemoryStorage::default();
+        let model = PreparingEmbeddingModel::new("local");
+        index_with_preparing_model(&workspace, &storage, &model)
+            .await
+            .expect("indexing succeeds");
+        assert_eq!(
+            model.prepares(),
+            1,
+            "the model must be prepared once, not once per batch"
+        );
+        assert_eq!(model.embeds(), 2, "one embedding call per batch");
+    }
+
+    #[tokio::test]
+    async fn remote_provider_is_not_prepared() {
+        let (_directory, workspace) = two_file_workspace_with("qwen");
+        let storage = MemoryStorage::default();
+        let model = PreparingEmbeddingModel::new("qwen");
+        index_with_preparing_model(&workspace, &storage, &model)
+            .await
+            .expect("indexing succeeds");
+        assert_eq!(
+            model.prepares(),
+            0,
+            "remote providers hold no local artifacts to prepare"
+        );
+        assert_eq!(model.embeds(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_preparation_stops_before_any_embedding() {
+        let (_directory, workspace) = two_file_workspace();
+        let storage = MemoryStorage::default();
+        let model = PreparingEmbeddingModel::failing_preparation(
+            "local",
+            crate::models::MODEL2VEC_LOAD_FAILED,
+            "Unable to load Model2Vec tokenizer",
+        );
+        let error = index_with_preparing_model(&workspace, &storage, &model)
+            .await
+            .expect_err("a failed preparation stops the operation");
+        assert_eq!(error.code(), crate::models::MODEL2VEC_LOAD_FAILED);
+        assert_eq!(model.prepares(), 1);
+        assert_eq!(
+            model.embeds(),
+            0,
+            "no batch may be queued against an unprepared model"
+        );
+        let files = storage.list_files().expect("files");
+        assert!(
+            files.iter().all(|file| file.index_status.error().is_none()),
+            "a failed preparation must not be recorded against each file"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_workspace_does_not_prepare_the_model_again() {
+        let (_directory, workspace) = two_file_workspace();
+        let storage = MemoryStorage::default();
+        let model = PreparingEmbeddingModel::new("local");
+        index_with_preparing_model(&workspace, &storage, &model)
+            .await
+            .expect("initial index");
+        let embeds = model.embeds();
+        index_with_preparing_model(&workspace, &storage, &model)
+            .await
+            .expect("unchanged index");
+        assert_eq!(
+            model.prepares(),
+            1,
+            "nothing new to embed means no preparation"
+        );
+        assert_eq!(model.embeds(), embeds);
     }
 }

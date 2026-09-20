@@ -298,6 +298,15 @@ impl EmbeddingModel for Model2VecEmbeddingModel {
         }
     }
 
+    async fn prepare(&self, options: EmbeddingOptions) -> Result<(), ModelError> {
+        // Mirrors the TypeScript backend: cancelled before loading, refused after,
+        // so a queued batch never runs against a half-prepared model.
+        check_cancelled(options.signal.as_ref())?;
+        self.ensure_loaded(options.on_progress).await?;
+        check_cancelled(options.signal.as_ref())?;
+        Ok(())
+    }
+
     async fn embed(
         &self,
         inputs: &[Vec<Content>],

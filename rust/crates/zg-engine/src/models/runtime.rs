@@ -248,13 +248,33 @@ impl ModelRuntimeLease {
     pub(super) async fn embed_impl(
         &self,
         inputs: &[Vec<Content>],
-        mut options: EmbeddingOptions,
+        options: EmbeddingOptions,
         progress: Option<ModelProgressReporter>,
     ) -> Result<EmbeddingResult, ModelError> {
         let _permit = self
             .acquire_operation_permit(options.signal.as_ref())
             .await?;
         let _active = ActiveEmbeddingGuard::new(&self.entry.runtime.active_embeddings);
+        let options = self.attach_progress(options, progress);
+        self.entry.runtime.model.embed(inputs, options).await
+    }
+
+    pub(super) async fn prepare_impl(
+        &self,
+        options: EmbeddingOptions,
+        progress: Option<ModelProgressReporter>,
+    ) -> Result<(), ModelError> {
+        let options = self.attach_progress(options, progress);
+        self.entry.runtime.model.prepare(options).await
+    }
+
+    /// Applies this lease's execution limit and forwards model progress to the
+    /// caller's reporter before the model's own callback runs.
+    fn attach_progress(
+        &self,
+        mut options: EmbeddingOptions,
+        progress: Option<ModelProgressReporter>,
+    ) -> EmbeddingOptions {
         options.execution_concurrency = self.operation.limit;
         if let Some(reporter) = progress {
             let model_progress = options.on_progress.take();
@@ -266,7 +286,7 @@ impl ModelRuntimeLease {
                 reporter.report(progress, operation.limit);
             }));
         }
-        self.entry.runtime.model.embed(inputs, options).await
+        options
     }
 
     async fn acquire_operation_permit(

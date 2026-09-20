@@ -90,6 +90,15 @@ impl runtime::ModelRuntimeLease {
     ) -> Result<EmbeddingResult, ModelError> {
         self.embed_impl(inputs, options, progress).await
     }
+
+    /// Loads local artifacts before any embedding batch is queued.
+    pub(crate) async fn prepare(
+        &self,
+        options: EmbeddingOptions,
+        progress: Option<ModelProgressReporter>,
+    ) -> Result<(), ModelError> {
+        self.prepare_impl(options, progress).await
+    }
 }
 
 #[cfg(test)]
