@@ -21,7 +21,6 @@ use zg_engine::{
 };
 
 const MAX_PERSISTED_ERROR_CHARS: usize = 512;
-const REDACTED: &str = "[redacted]";
 // Finished jobs remain available for late waiters without growing resident history forever.
 const MAX_RETAINED_FINISHED_JOBS: usize = 256;
 
@@ -729,118 +728,9 @@ fn job_error(error: EngineError) -> JobError {
 }
 
 fn redact_job_error_text(message: &str) -> String {
-    let mut redacted = redact_bearer_credentials(message);
-    for name in [
-        "authorization",
-        "api_key",
-        "api-key",
-        "api key",
-        "apikey",
-        "token",
-    ] {
-        redacted = redact_assigned_value(&redacted, name);
-    }
-    let mut truncated = redacted
-        .chars()
-        .take(MAX_PERSISTED_ERROR_CHARS)
-        .collect::<String>();
-    if redacted.chars().count() > MAX_PERSISTED_ERROR_CHARS {
-        truncated.push('…');
-    }
-    truncated
-}
-
-fn redact_bearer_credentials(message: &str) -> String {
-    let mut output = message.to_owned();
-    let mut cursor = 0;
-    loop {
-        let lowercase = output.to_ascii_lowercase();
-        let Some(relative_start) = lowercase[cursor..].find("bearer") else {
-            return output;
-        };
-        let marker_start = cursor + relative_start;
-        let marker_end = marker_start + "bearer".len();
-        let before_is_word =
-            marker_start > 0 && lowercase.as_bytes()[marker_start - 1].is_ascii_alphanumeric();
-        let after_is_space = lowercase
-            .as_bytes()
-            .get(marker_end)
-            .is_some_and(u8::is_ascii_whitespace);
-        if before_is_word || !after_is_space {
-            cursor = marker_end;
-            continue;
-        }
-        let value_start = skip_ascii_whitespace(output.as_bytes(), marker_end);
-        let value_end = credential_end(output.as_bytes(), value_start);
-        if value_start == value_end {
-            cursor = marker_end;
-            continue;
-        }
-        output.replace_range(value_start..value_end, REDACTED);
-        cursor = value_start + REDACTED.len();
-    }
-}
-
-fn redact_assigned_value(message: &str, name: &str) -> String {
-    let mut output = message.to_owned();
-    let mut cursor = 0;
-    loop {
-        let lowercase = output.to_ascii_lowercase();
-        let Some(relative_start) = lowercase[cursor..].find(name) else {
-            return output;
-        };
-        let name_start = cursor + relative_start;
-        let name_end = name_start + name.len();
-        let before_is_word =
-            name_start > 0 && is_identifier_byte(lowercase.as_bytes()[name_start - 1]);
-        let after_is_word = lowercase
-            .as_bytes()
-            .get(name_end)
-            .copied()
-            .is_some_and(is_identifier_byte);
-        if before_is_word || after_is_word {
-            cursor = name_end;
-            continue;
-        }
-        let separator = skip_ascii_whitespace(output.as_bytes(), name_end);
-        if !output
-            .as_bytes()
-            .get(separator)
-            .is_some_and(|byte| matches!(byte, b'=' | b':'))
-        {
-            cursor = name_end;
-            continue;
-        }
-        let value_start = skip_ascii_whitespace(output.as_bytes(), separator + 1);
-        let value_end = credential_end(output.as_bytes(), value_start);
-        if value_start == value_end {
-            cursor = name_end;
-            continue;
-        }
-        output.replace_range(value_start..value_end, REDACTED);
-        cursor = value_start + REDACTED.len();
-    }
-}
-
-fn skip_ascii_whitespace(bytes: &[u8], mut cursor: usize) -> usize {
-    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor += 1;
-    }
-    cursor
-}
-
-fn credential_end(bytes: &[u8], mut cursor: usize) -> usize {
-    while bytes
-        .get(cursor)
-        .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b',' | b';'))
-    {
-        cursor += 1;
-    }
-    cursor
-}
-
-fn is_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
+    // Shared with the CLI and MCP surfaces so every rendering of an error hides
+    // the same credential shapes; the TypeScript oracle redacts the same fields.
+    zg_engine::redaction::redact_text(message, MAX_PERSISTED_ERROR_CHARS)
 }
 
 async fn wait_for_job(

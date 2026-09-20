@@ -20,6 +20,7 @@ Layout grows only when real fixtures are captured:
 ```text
 compat/
   cli/                    # argv/stdout/stderr/exit-code cases
+  redaction/              # credential-redaction cases captured from the oracle
   schema/                 # versioned fixture schemas
   mode-differences.toml   # allowed Direct/Server differences
   allowed-differences.toml

@@ -4040,6 +4040,7 @@ dependencies = [
  "llama-cpp-2",
  "ort",
  "rayon",
+ "regex",
  "reqwest",
  "rustix",
  "serde",
