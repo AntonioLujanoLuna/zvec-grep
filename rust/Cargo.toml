@@ -26,6 +26,7 @@ hyper = { version = "1.11.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 ignore = "0.4.33"
 notify = "8.2.0"
+regex = "1.13.1"
 rmcp = { version = "3.1.4", features = ["macros", "schemars", "server", "transport-streamable-http-server"] }
 same-file = "1.0.6"
 schemars = "1"

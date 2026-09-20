@@ -9,6 +9,19 @@ use zg_engine::api::index::progress::{
     IndexEmbeddingStage, IndexProgress, IndexProgressPhase, IndexProgressReporter,
 };
 
+/// Message and detail limits the TypeScript CLI applies when it redacts error
+/// text and status details (`src/cli/errors.ts`, `src/cli/format/status.ts`).
+const PROGRESS_MESSAGE_CHARS: usize = 512;
+const PROGRESS_DETAIL_CHARS: usize = 4_096;
+
+/// Redacts credential shapes before progress text reaches the terminal.
+///
+/// Progress messages can carry provider URLs and warning text from model
+/// downloads, so they go through the same shared redaction as error reports.
+fn redact(value: &str, max_chars: usize) -> String {
+    zg_engine::redaction::redact_text(value, max_chars)
+}
+
 /// Owns terminal progress state and finishes the live line on success or failure.
 pub struct IndexProgressDisplay {
     state: Arc<Mutex<ProgressOutput>>,
@@ -278,7 +291,11 @@ fn format_progress(progress: &IndexProgress) -> (String, String) {
             }
         }
         if let Some(message) = &embedding.message {
-            let _ = write!(line, " — {}", clean(message));
+            let _ = write!(
+                line,
+                " — {}",
+                clean(&redact(message, PROGRESS_MESSAGE_CHARS))
+            );
         }
         return (label.into(), line);
     }
@@ -299,7 +316,7 @@ fn format_progress(progress: &IndexProgress) -> (String, String) {
         let _ = write!(line, ", {failed} failed");
     }
     if let Some(detail) = &progress.detail {
-        let _ = write!(line, " — {}", clean(detail));
+        let _ = write!(line, " — {}", clean(&redact(detail, PROGRESS_DETAIL_CHARS)));
     }
     (label.into(), line)
 }
@@ -408,5 +425,33 @@ mod tests {
         );
         progress.embedding.as_mut().expect("embedding").total_bytes = None;
         assert!(format_progress(&progress).1.ends_with("1 KiB"));
+    }
+
+    #[test]
+    fn redacts_credentials_in_progress_text() {
+        let mut progress = IndexProgress {
+            phase: IndexProgressPhase::Indexing,
+            files_total: Some(1),
+            files_indexed: Some(1),
+            files_failed: None,
+            detail: Some("download failed token=progress-secret".into()),
+            embedding: None,
+        };
+        assert_eq!(
+            format_progress(&progress).1,
+            "Indexing: 1/1 files — download failed token=[redacted]"
+        );
+
+        progress.detail = None;
+        progress.embedding = Some(IndexEmbeddingProgress {
+            stage: Some(IndexEmbeddingStage::Warning),
+            model: Some("local/model".into()),
+            message: Some("fallback to https://user:pw@mirror.example/models".into()),
+            ..IndexEmbeddingProgress::default()
+        });
+        assert_eq!(
+            format_progress(&progress).1,
+            "Model warning: local/model — fallback to https://[redacted]@mirror.example/models"
+        );
     }
 }

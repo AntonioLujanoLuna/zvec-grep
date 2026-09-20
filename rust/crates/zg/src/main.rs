@@ -18,14 +18,32 @@ use zg_cli::{
 };
 use zg_daemon::{DaemonStatus, ListenAddress, McpToolset as DaemonMcpToolset, ServerConfig};
 use zg_daemon_protocol::{DaemonCommand, DaemonReply};
-use zg_engine::{EngineError, ZvecGrep, api::context::ContextOptions};
+use zg_engine::{EngineError, ErrorReport, ZvecGrep, api::context::ContextOptions};
+
+/// Character limits the TypeScript CLI uses when it redacts error text
+/// (`src/cli/errors.ts`): 512 for the message and 4096 for context details.
+const CLI_ERROR_MESSAGE_CHARS: usize = 512;
+const CLI_ERROR_DETAIL_CHARS: usize = 4_096;
+
+/// Redacts credential shapes before an error reaches stdout or stderr.
+///
+/// Applies in Direct and Server mode alike, because both render the report here.
+fn redacted_report(report: ErrorReport) -> ErrorReport {
+    ErrorReport {
+        message: zg_engine::redaction::redact_text(&report.message, CLI_ERROR_MESSAGE_CHARS),
+        help: report
+            .help
+            .map(|help| zg_engine::redaction::redact_text(&help, CLI_ERROR_DETAIL_CHARS)),
+        ..report
+    }
+}
 
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             if let Some(error) = error.downcast_ref::<EngineError>() {
-                eprintln!("{}", error.report());
+                eprintln!("{}", redacted_report(error.report()));
             } else {
                 eprintln!("Error: {error}");
             }

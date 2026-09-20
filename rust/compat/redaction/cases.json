@@ -1,0 +1,152 @@
+{
+  "oracle": {
+    "implementation": "typescript",
+    "file": "src/engine/errors.ts",
+    "function": "redactErrorText",
+    "mainCommit": "b1d0ce9a83448f90db4d5fdb17faae7a2f01a790",
+    "capturedAt": "2026-09-20",
+    "notes": "Cases are captured from the TypeScript implementation, which is the behavioral oracle during the Rust rewrite. Inputs are synthetic credentials."
+  },
+  "cases": [
+    {
+      "input": "fetch failed token=model-download-secret",
+      "maxChars": 512,
+      "expected": "fetch failed token=[redacted]"
+    },
+    {
+      "input": "api_key=abc123 status=401",
+      "maxChars": 512,
+      "expected": "api_key=[redacted] status=401"
+    },
+    {
+      "input": "api-key: 'quoted-secret'",
+      "maxChars": 512,
+      "expected": "api-key: [redacted]"
+    },
+    {
+      "input": "{\"api key\": \"json-secret\", \"other\": 1}",
+      "maxChars": 512,
+      "expected": "{\"api key\": [redacted], \"other\": 1}"
+    },
+    {
+      "input": "Authorization: Bearer sk-abcdefgh12345",
+      "maxChars": 512,
+      "expected": "Authorization: [redacted]"
+    },
+    {
+      "input": "authorization=Basic dXNlcjpwYXNz",
+      "maxChars": 512,
+      "expected": "authorization=[redacted]"
+    },
+    {
+      "input": "GET https://user:pa%40ss@example.com/path",
+      "maxChars": 512,
+      "expected": "GET https://[redacted]@example.com/path"
+    },
+    {
+      "input": "url=https://user@example.com/x",
+      "maxChars": 512,
+      "expected": "url=https://[redacted]@example.com/x"
+    },
+    {
+      "input": "endpoint=http://user:pass@localhost:8080/v1",
+      "maxChars": 512,
+      "expected": "endpoint=http://[redacted]@localhost:8080/v1"
+    },
+    {
+      "input": "Bearer standalone-token-here",
+      "maxChars": 512,
+      "expected": "Bearer [redacted]"
+    },
+    {
+      "input": "Basic abc",
+      "maxChars": 512,
+      "expected": "Basic [redacted]"
+    },
+    {
+      "input": "password=hunter2 secret=s3cr3t",
+      "maxChars": 512,
+      "expected": "password=[redacted] secret=[redacted]"
+    },
+    {
+      "input": "access_token=a1 refresh_token=b2 id_token=c3",
+      "maxChars": 512,
+      "expected": "access_token=[redacted] refresh_token=[redacted] id_token=[redacted]"
+    },
+    {
+      "input": "key sk-1234567890abcdefgh trailing",
+      "maxChars": 512,
+      "expected": "key sk-[redacted] trailing"
+    },
+    {
+      "input": "no credentials here",
+      "maxChars": 512,
+      "expected": "no credentials here"
+    },
+    {
+      "input": "https://host/path?token=abc&x=1",
+      "maxChars": 512,
+      "expected": "https://host/path?token=[redacted]&x=1"
+    },
+    {
+      "input": "Authorization: \"Bearer quoted\" trailing",
+      "maxChars": 512,
+      "expected": "Authorization: [redacted] trailing"
+    },
+    {
+      "input": "1http://user@host/path",
+      "maxChars": 512,
+      "expected": "1http://user@host/path"
+    },
+    {
+      "input": "mailto:user@example.com",
+      "maxChars": 512,
+      "expected": "mailto:user@example.com"
+    },
+    {
+      "input": "s3://bucket/data",
+      "maxChars": 512,
+      "expected": "s3://bucket/data"
+    },
+    {
+      "input": "myapp://a:b@c/d then app://d:e@f/g",
+      "maxChars": 512,
+      "expected": "myapp://[redacted]@c/d then app://[redacted]@f/g"
+    },
+    {
+      "input": "GET https://user@example.com/x and https://other@example.com/y",
+      "maxChars": 512,
+      "expected": "GET https://[redacted]@example.com/x and https://[redacted]@example.com/y"
+    },
+    {
+      "input": "Bearer dXNlcjpwYXNz; next",
+      "maxChars": 512,
+      "expected": "Bearer [redacted]; next"
+    },
+    {
+      "input": "token=\"quoted value with space\"",
+      "maxChars": 512,
+      "expected": "token=[redacted]"
+    },
+    {
+      "input": "secret: 'sq'",
+      "maxChars": 512,
+      "expected": "secret: [redacted]"
+    },
+    {
+      "input": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx token=very-last-secret",
+      "maxChars": 512,
+      "expected": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\u2026"
+    },
+    {
+      "input": "token=short-secret",
+      "maxChars": 8,
+      "expected": "token=[\u2026"
+    },
+    {
+      "input": "token=secret",
+      "maxChars": 0,
+      "expected": "token=[redacted\u2026"
+    }
+  ]
+}
