@@ -228,13 +228,25 @@ Relevant code: [model catalog](crates/zg-engine/src/models/catalog.rs),
   (`crates/zg-engine/src/models/artifacts.rs`). Still missing: source preference,
   snapshot selection and the ModelScope fallback, since the Rust catalog records
   one repository per source without main's snapshot layout.
-- `[ ]` Add response-header and read-idle deadlines.
-  `reqwest::Client::new()` is used with no configured timeout for Model2Vec,
-  Transformers, and llama.cpp downloads
-  (`models/model2vec/model.rs:380`, `models/transformers/mod.rs:149`,
-  `models/llama_cpp/mod.rs:147`); only the Qwen remote path sets `.timeout(REMOTE_TIMEOUT)`
-  (`models/qwen/mod.rs:302-303`), which is a total deadline rather than the
-  header/read-idle pair main uses.
+- `[x]` Add response-header and read-idle deadlines. Implemented on this branch in
+  `crates/zg-engine/src/models/download.rs`, which every local backend now goes
+  through:
+  - The budgets are main's: 10 s for response headers and 30 s of read idle
+    (`DEFAULT_RESPONSE_HEADER_TIMEOUT_MS` / `DEFAULT_READ_IDLE_TIMEOUT_MS`,
+    `src/engine/models/artifact-downloader.ts:142-143`), pinned by
+    `defaults_match_main`.
+  - `DownloadTimeouts::send` bounds the whole header phase — connection included —
+    with a `tokio::time::timeout` around the request, and reports the URL and the
+    budget it applied; `DownloadTimeouts::next_chunk` bounds the gap between body
+    chunks, so a connection that stops delivering mid-artifact fails instead of
+    holding an indexing run open.
+  - Model2Vec, Transformers and llama.cpp all use it for both the response and
+    every body chunk, including the Transformers optional-artifact `HEAD` probe,
+    which previously could wait forever. The Qwen remote path keeps its own total
+    timeout, which is a different (API) deadline.
+  - Evidence: five tests, including a stalling TCP stub for a server that never
+    answers and one that stops mid-body, both asserted to fail well inside the
+    injected budget and to name the budget in the error context.
 - `[~]` Verify cached/downloaded artifacts, repair completion metadata, and
   publish atomically. Implemented on this branch: `verify_artifact` streams the
   file and compares size and SHA-256 against the catalog entry, shared by
@@ -433,9 +445,13 @@ where an oracle exists, a captured `compat/` fixture.
    work item B slice). Pinned GGUF revisions with fragment-aware URI resolution,
    catalog artifact/source tables captured from main, streaming size and
    checksum verification on downloads and cache hits, and a refreshed catalog
-   oracle that now detects drift. Remaining B slices, in order: response-header
-   and read-idle deadlines, completion-metadata repair, cross-process download
-   coordination, and the ModelScope fallback that the recorded revisions enable.
+   oracle that now detects drift.
+6. **B3 download deadlines — implemented on this branch.** `models/download.rs`
+   bounds the header phase and the idle gap between body chunks with main's 10 s /
+   30 s budgets, shared by all three local backends and pinned by tests against a
+   stalling stub server. Remaining B slices, in order: completion-metadata repair,
+   cross-process download coordination, and the ModelScope fallback that the
+   recorded revisions enable.
 
 Verification for each slice: workspace tests via `rust/scripts/check.sh`, request
 counts for permanent versus transient failures, preparation failure across
@@ -447,9 +463,10 @@ Covered on this branch: request counts for permanent (one attempt), transient
 failure that must not be retried for the next batch, the abort/per-file split,
 one preparation per pass, no preparation for remote providers, no embedding call
 after a failed preparation, no preparation for an unchanged workspace, pinned
-GGUF URI resolution (including unpinned and malformed revisions), and artifact
+GGUF URI resolution (including unpinned and malformed revisions), artifact
 verification for matching bytes, substituted contents, wrong sizes, missing
-files, unrecorded artifacts and mismatched downloads. Cancellation while a retry
+files, unrecorded artifacts and mismatched downloads, and both download
+deadlines against a server that never answers and one that stops mid-body. Cancellation while a retry
 delay is pending is not yet asserted.
 
 ## Completion
