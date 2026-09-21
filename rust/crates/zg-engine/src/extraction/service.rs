@@ -34,15 +34,16 @@ pub(super) fn extract<'source>(
     if let Some(source_text) = source_text {
         for entity in &entities {
             if let Range::Text(range) = &entity.source_range {
-                let original = range.slice(source_text)?;
+                let original = crate::utils::slice_text(
+                    source_text,
+                    range.start_byte_offset(),
+                    range.end_byte_offset(),
+                )?;
                 if !matches!(&entity.content, Content::Text(content) if content == original) {
                     return Err(EngineError::internal(
                         "entity content differs from its source range",
                     ));
                 }
-            }
-            for fragment in &entity.fragments {
-                fragment.range.validate_content(&entity.content)?;
             }
         }
     }
