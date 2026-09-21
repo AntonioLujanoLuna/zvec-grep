@@ -36,6 +36,7 @@ file_formats! {
     Dotenv => ("dotenv", [Data], ["env"], [".env", ".flaskenv", ".env.local", ".env.development", ".env.production", ".env.test", ".env.development.local", ".env.production.local", ".env.test.local"]),
     Elixir => ("elixir", [Code], ["ex", "exs"], []),
     Eml => ("eml", [Document], ["eml"], []),
+    Eps => ("eps", [Image], ["eps"], []),
     Epub => ("epub", [Document], ["epub"], []),
     Erlang => ("erlang", [Code], ["erl", "hrl"], []),
     Excel => ("excel", [Document], ["xls", "xlsb", "xlsm", "xlsx", "xlt", "xltm", "xltx", "xla", "xlam", "XLS", "XLSB", "XLSM", "XLSX", "XLT", "XLTM", "XLTX", "XLA", "XLAM", "Xls", "Xlsb", "Xlsm", "Xlsx", "Xlt", "Xltm", "Xltx", "Xla", "Xlam"], []),
@@ -85,7 +86,6 @@ file_formats! {
     Mov => ("mov", [Video], ["mov", "qt", "MOV", "QT", "Mov", "Qt"], []),
     Mp3 => ("mp3", [Audio], ["mp3", "MP3", "Mp3"], []),
     Mp4 => ("mp4", [Video], ["mp4", "MP4", "Mp4"], []),
-    Mpeg => ("mpeg", [Video], ["mpeg", "mpg", "m2ts", "mts", "ts", "MPEG", "MPG", "M2TS", "MTS", "TS", "Mpeg", "Mpg", "M2ts", "Mts", "Ts"], []),
     Msg => ("msg", [Document], ["msg"], []),
     Numbers => ("numbers", [Document], ["numbers"], []),
     ObjectiveC => ("objective-c", [Code], ["mm", "m"], []),
@@ -160,14 +160,6 @@ file_formats! {
     Zip => ("zip", [Archive], ["zip", "ZIP", "pyz", "pyzw", "Zip"], []),
     Zsh => ("zsh", [Code], ["zsh"], [".zshrc", ".zprofile", ".zshenv", ".zlogin", ".zlogout", "zshrc", "zprofile", "zshenv", "zlogin", "zlogout"]),
     Zstd => ("zstd", [Archive], ["zst", "zstd"], []),
-}
-
-/// Some extensions legitimately match multiple formats and need no further probing.
-pub(super) fn needs_sniff(formats: &[FileFormat]) -> bool {
-    formats.len() > 1
-        && !formats
-            .iter()
-            .all(|format| matches!(format, FileFormat::C | FileFormat::Cpp))
 }
 
 #[cfg(test)]

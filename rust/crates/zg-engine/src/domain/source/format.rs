@@ -80,7 +80,7 @@ impl<'de> serde::Deserialize<'de> for FileFormat {
 }
 
 impl FileFormat {
-    /// Matches catalog suffixes and basenames exactly, then probes contents if needed.
+    /// Trusts catalog matches; probes only unmatched files without a suffix.
     pub(crate) fn from_path(path: &Path) -> EngineResult<Vec<Self>> {
         let file_name = path.file_name().ok_or_else(|| {
             EngineError::invalid_argument(format!(
@@ -94,10 +94,12 @@ impl FileFormat {
         let mut formats = Vec::with_capacity(file_name_formats.len() + extension_formats.len());
         formats.extend_from_slice(extension_formats);
         formats.extend_from_slice(file_name_formats);
-        let needs_sniff = formats.is_empty() || catalog::needs_sniff(extension_formats);
-        if !needs_sniff {
-            normalize_formats(&mut formats);
+        normalize_formats(&mut formats);
+        if !formats.is_empty() {
             return Ok(formats);
+        }
+        if path.extension().is_some() {
+            return Ok(vec![Self::Unknown]);
         }
 
         let metadata = fs::metadata(path).map_err(|error| {
@@ -140,15 +142,9 @@ impl FileFormat {
             })?;
         let complete = header.len() <= HEADER_BYTES;
         header.truncate(HEADER_BYTES);
-        // Refine only extension candidates, then restore the exact-name matches.
-        formats.truncate(extension_formats.len());
-        formats = sniff::refine(formats, &header, complete);
-        formats.extend_from_slice(file_name_formats);
-        normalize_formats(&mut formats);
-        if formats.is_empty() {
-            formats.push(Self::Unknown);
-        }
-        Ok(formats)
+        Ok(vec![
+            sniff::script(&header, complete).unwrap_or(Self::Unknown),
+        ])
     }
 }
 

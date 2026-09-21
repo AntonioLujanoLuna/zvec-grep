@@ -476,25 +476,19 @@ async fn filename_formats_and_categories_filter_queries_without_limiting_indexin
             updated.files_deleted,
             updated.files_failed
         ),
-        (1, 0, 0)
+        (0, 1, 0)
     );
     let files = native_file_records(&info.index_path)?;
-    let script = files
-        .iter()
-        .find(|file| file["relative_path"]["value"] == "script")
-        .expect("reclassified script stays indexed");
-    assert!(script.get("formats").is_none());
+    assert!(
+        files
+            .iter()
+            .all(|file| file["relative_path"]["value"] != "script")
+    );
     assert_index_and_queries(
         &engine,
         root,
         &QueryFilter::default(),
-        &paths(&[
-            "script",
-            "page.html",
-            "note.md",
-            "settings.json",
-            "source.rs",
-        ]),
+        &paths(&["page.html", "note.md", "settings.json", "source.rs"]),
     )
     .await?;
     for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
@@ -552,10 +546,7 @@ async fn catalog_name_predicates_filter_both_native_search_routes() -> TestResul
     write_sources(root, &sources)?;
     let engine = ZvecGrep::new();
     let indexed = engine.index(index_options(root)).await?;
-    assert_eq!(
-        (indexed.files_added, indexed.files_failed),
-        (sources.len(), 0)
-    );
+    assert_eq!((indexed.files_added, indexed.files_failed), (5, 0));
     for (name, _) in sources {
         fs::remove_file(root.join(name))?;
     }

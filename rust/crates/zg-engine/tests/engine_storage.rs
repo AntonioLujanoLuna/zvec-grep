@@ -463,7 +463,13 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
 
     let engine = ZvecGrep::new();
     let initial = engine.index(index_options(root)).await?;
-    assert_eq!(initial.files_added, 3, "{initial:?}");
+    assert_eq!(initial.files_added, 2, "{initial:?}");
+    assert!(
+        initial
+            .skipped
+            .iter()
+            .any(|file| file.path == root.join("tmp"))
+    );
     assert_eq!(initial.files_failed, 0);
     let info = engine.info(info_options(root)).await?;
     assert!(info.indexed);
@@ -477,7 +483,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
         .expect("FTS info");
     assert_eq!(fts.tokenizer, "jieba");
     assert_eq!(fts.filters, ["lowercase"]);
-    assert_eq!(info.status.as_ref().expect("status").files_indexed, 3);
+    assert_eq!(info.status.as_ref().expect("status").files_indexed, 2);
     assert_eq!(
         fts_paths(&engine, root, "orchard").await?,
         [PathBuf::from("auth.rs")]
@@ -504,7 +510,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
     );
     let calls = server.requests.load(Ordering::Acquire);
     let unchanged = engine.index(index_options(root)).await?;
-    assert_eq!(unchanged.files_unchanged, 3);
+    assert_eq!(unchanged.files_unchanged, 2);
     assert_eq!(server.requests.load(Ordering::Acquire), calls);
     engine.close();
     assert_eq!(
@@ -578,7 +584,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
             ..index_options(root)
         })
         .await?;
-    assert_eq!(rebuilt.files_added, 3);
+    assert_eq!(rebuilt.files_added, 2);
     let after_rebuild = engine.info(info_options(root)).await?;
     assert_eq!(
         after_rebuild

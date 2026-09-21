@@ -3163,9 +3163,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indexes_readable_unknown_sources_and_skips_binary_or_unavailable_readers() {
+    async fn indexes_catalog_sources_and_shebang_scripts_only() {
         let directory = tempdir().expect("temporary directory");
         std::fs::write(directory.path().join("readable"), "ordinary text 中文 😀").expect("text");
+        std::fs::write(directory.path().join("known.txt"), "ordinary text 中文 😀")
+            .expect("catalog text");
+        std::fs::write(directory.path().join("script"), "#!/bin/sh\necho hello\n")
+            .expect("shebang script");
         let mut utf16 = vec![0xff, 0xfe];
         utf16.extend("UTF-16 文本 😀".encode_utf16().flat_map(u16::to_le_bytes));
         std::fs::write(directory.path().join("encoded"), utf16).expect("UTF-16");
@@ -3201,21 +3205,21 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|file| file.index_status.is_indexed()));
         assert_eq!(storage.identities.lock().expect("catalog").len(), 2);
-        assert_eq!(result.skipped.len(), 3);
+        assert_eq!(result.skipped.len(), 5);
     }
 
     #[tokio::test]
     async fn classification_errors_stay_with_files_and_missing_timestamps_are_not_cached() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("fixture");
-        std::fs::write(&path, "text").expect("fixture");
+        std::fs::write(&path, "#!/bin/sh\necho hello\n").expect("fixture");
         let workspace = workspace(directory.path());
         let discovered = DiscoveredFile {
             root: directory.path().to_path_buf(),
             relative_path: PathBuf::from("fixture"),
-            size_bytes: 4,
+            size_bytes: 21,
             modified_epoch_ms: None,
-            source_fingerprint: "metadata-v1:4:unknown".to_owned(),
+            source_fingerprint: "metadata-v1:21:unknown".to_owned(),
         };
         let control = TaskControl::default();
         let (first, _) = classify_files(&workspace, vec![discovered.clone()], &[], &control)
@@ -3239,7 +3243,7 @@ mod tests {
         .expect("reclassify");
         assert_eq!(
             second[0].formats.as_deref(),
-            Some([FileFormat::Text].as_slice())
+            Some([FileFormat::Shell].as_slice())
         );
         assert_eq!(compute_diff(second, &[stored]).modified, 1);
         std::fs::remove_file(path).expect("remove source during scan");
@@ -3334,6 +3338,8 @@ mod tests {
     #[tokio::test]
     async fn restoring_default_size_limits_rechecks_unchanged_files() {
         let directory = tempdir().expect("temporary directory");
+        std::fs::write(directory.path().join("large.rs"), "fn main() {}\n")
+            .expect("source for format validation");
         let mut workspace = workspace(directory.path());
         workspace.scan.max_file_size_bytes = Some(3 * MIN_DEFAULT_FILE_SIZE_BYTES);
         let discovered = DiscoveredFile {
@@ -3389,7 +3395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_unchanged_extensionless_text_keeps_its_index_after_classification() {
+    async fn large_unchanged_extensionless_text_is_skipped_after_classification() {
         let directory = tempdir().expect("temporary directory");
         let workspace = workspace(directory.path());
         let size = MIN_DEFAULT_FILE_SIZE_BYTES + 1;
@@ -3426,12 +3432,9 @@ mod tests {
         )
         .await
         .expect("text classification");
-        assert!(skipped.is_empty());
-        assert_eq!(
-            scanned[0].formats.as_deref(),
-            Some([FileFormat::Text].as_slice())
-        );
-        assert_eq!(compute_diff(scanned, &[stored]).unchanged, 1);
+        assert!(scanned.is_empty());
+        assert_eq!(skipped[0].reason, SkippedFileReason::Unsupported);
+        assert_eq!(compute_diff(scanned, &[stored]).deleted.len(), 1);
     }
 
     #[test]
