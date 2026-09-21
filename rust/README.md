@@ -46,6 +46,34 @@ embedding calls may execute concurrently against those shared resources.
 surfaces model downloads through `IndexProgress::embedding`. The reporter is
 runtime-only and is omitted from serialized daemon requests.
 
+The daemon enables an index read-session cache with a 60-second idle timeout.
+Sequential and concurrent queries reuse the same generation's native storage
+handles. Each request still reads current workspace metadata and resolves its
+own model settings. Standalone engine instances can opt in with
+`ZvecGrep::enable_read_session_cache()`; `close()` retires the cache while
+in-flight queries retain their handles until completion.
+
+Native open and close run under a per-workspace slot; the cache map lock only
+manages entries, so a cold open or retirement cannot block another workspace's
+cache hit.
+
+Workspace reads and writes queue asynchronously. A cross-process writer-intent
+lock prevents new reads from overtaking waiting writers while active readers
+drain. Writers then retire cached handles before opening writable storage.
+`ContextOptions::lock_timeout_ms` and `IndexOptions::lock_timeout_ms` bound lock
+waits (30 seconds by default), including idle-cache draining; their cancellation
+tokens interrupt waiting. Cache maintenance checks for writers every 50 milliseconds,
+independently of the async executor. Cancelled, timed-out and aborted waiters
+release admission without leaving pending writer markers.
+
+Within one engine, queries using `Off` or `Background` refresh may borrow an active
+incremental writer when the effective model configuration matches (including
+credentials, endpoint, device and model cache). Borrowed queries keep storage,
+models and the home lock alive; publication waits for them to finish. `Wait` and
+legacy synchronous auto-update queries never borrow partial writer state. A
+rebuild's unpublished generation remains private. The daemon preserves the refresh
+policy when invoking the engine and also bounds cancellable waits for scheduled jobs.
+
 The native engine supports indexing, indexed FTS and vector search, `zg query
 --rg`, workspace discovery, `info`, and idempotent `drop_index`.
 
