@@ -5,9 +5,48 @@ use std::{ops::Deref, sync::Arc, time::Duration};
 use tokio::time::Instant;
 
 use super::{WorkspaceRuntime, WorkspaceRuntimeManager, lock};
+use crate::DaemonError;
 
 const DEFAULT_IDLE_TTL: Duration = Duration::from_hours(4);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_mins(1);
+
+/// Node's maximum timer delay (`2_147_483_647` ms) rounded down to whole seconds.
+pub(crate) const MAX_TIMER_DELAY_SECONDS: u64 = 2_147_483;
+pub(crate) const WATCHER_IDLE_TIMEOUT_SECONDS_ENV: &str = "ZVEC_GREP_WATCHER_IDLE_TIMEOUT_SECONDS";
+
+/// Resolves the idle deadline from the environment, defaulting to four hours.
+///
+/// # Errors
+///
+/// Returns `DaemonError::InvalidWatcherIdleTimeout` when the value is not an
+/// integer between zero and `MAX_TIMER_DELAY_SECONDS` seconds. Zero disables
+/// idle retirement, matching the TypeScript manager that schedules no check.
+pub(crate) fn configured_idle_ttl() -> Result<Duration, DaemonError> {
+    parse_idle_ttl(
+        std::env::var(WATCHER_IDLE_TIMEOUT_SECONDS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Unset or blank values keep the default. Surrounding whitespace and leading
+/// zeros are accepted, exactly like the TypeScript `^\d+$` check.
+pub(crate) fn parse_idle_ttl(configured: Option<&str>) -> Result<Duration, DaemonError> {
+    let Some(configured) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_IDLE_TTL);
+    };
+    let invalid = || DaemonError::InvalidWatcherIdleTimeout {
+        max_seconds: MAX_TIMER_DELAY_SECONDS,
+    };
+    if !configured.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let seconds = configured.parse::<u64>().map_err(|_| invalid())?;
+    if seconds > MAX_TIMER_DELAY_SECONDS {
+        return Err(invalid());
+    }
+    Ok(Duration::from_secs(seconds))
+}
 
 pub(super) struct RuntimeLifecycle {
     last_used: Instant,
@@ -75,9 +114,15 @@ impl Drop for RuntimeActivity {
 }
 
 impl WorkspaceRuntimeManager {
+    #[cfg(test)]
     pub(super) const DEFAULT_IDLE_TTL: Duration = DEFAULT_IDLE_TTL;
 
     pub(super) fn start_maintenance(&self) {
+        // A zero deadline schedules no check in the TypeScript manager, so it
+        // disables retirement rather than retiring every runtime immediately.
+        if self.inner.idle_ttl.is_zero() {
+            return;
+        }
         let mut task = lock(&self.inner.maintenance);
         if task.is_some() || self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
             return;
@@ -99,6 +144,9 @@ impl WorkspaceRuntimeManager {
     }
 
     pub(super) async fn retire_idle(&self, now: Instant) {
+        if self.inner.idle_ttl.is_zero() {
+            return;
+        }
         let retired = {
             let mut runtimes = lock(&self.inner.runtimes);
             let mut retired = Vec::new();

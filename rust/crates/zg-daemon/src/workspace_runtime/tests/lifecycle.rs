@@ -1,6 +1,12 @@
 use super::*;
 
-fn idle_fixture() -> (
+use crate::workspace_runtime::lifecycle::{
+    MAX_TIMER_DELAY_SECONDS, WATCHER_IDLE_TIMEOUT_SECONDS_ENV, configured_idle_ttl, parse_idle_ttl,
+};
+
+fn idle_fixture_with_ttl(
+    idle_ttl: Duration,
+) -> (
     WorkspaceRuntimeManager,
     Arc<ManualWatcherFactory>,
     mpsc::Sender<WorkspaceChangeBatch>,
@@ -12,14 +18,23 @@ fn idle_fixture() -> (
         closes: Arc::new(AtomicUsize::new(0)),
     });
     (
-        WorkspaceRuntimeManager::new(
+        WorkspaceRuntimeManager::new_with_idle_ttl(
             Arc::new(RecordingExecutor::default()),
             watchers.clone(),
             SchedulerConfig::default(),
+            idle_ttl,
         ),
         watchers,
         sender,
     )
+}
+
+fn idle_fixture() -> (
+    WorkspaceRuntimeManager,
+    Arc<ManualWatcherFactory>,
+    mpsc::Sender<WorkspaceChangeBatch>,
+) {
+    idle_fixture_with_ttl(WorkspaceRuntimeManager::DEFAULT_IDLE_TTL)
 }
 
 async fn drain_runtime_callbacks() {
@@ -367,4 +382,132 @@ async fn retiring_one_workspace_preserves_shared_engine_models_and_persisted_ind
     drop(active);
     manager.shutdown_all().await.expect("shutdown");
     engine.close();
+}
+
+#[test]
+fn idle_deadline_defaults_to_four_hours_and_accepts_whole_seconds() {
+    assert_eq!(
+        WorkspaceRuntimeManager::DEFAULT_IDLE_TTL,
+        Duration::from_hours(4)
+    );
+    for unset in [None, Some(""), Some("   ")] {
+        assert_eq!(
+            parse_idle_ttl(unset).expect("default deadline"),
+            Duration::from_hours(4),
+            "{unset:?}"
+        );
+    }
+    assert_eq!(
+        parse_idle_ttl(Some("90")).expect("seconds"),
+        Duration::from_secs(90)
+    );
+    assert_eq!(
+        parse_idle_ttl(Some(" 90 ")).expect("trimmed seconds"),
+        Duration::from_secs(90)
+    );
+    assert_eq!(
+        parse_idle_ttl(Some("00090")).expect("leading zeros"),
+        Duration::from_secs(90)
+    );
+    assert_eq!(parse_idle_ttl(Some("0")).expect("disabled"), Duration::ZERO);
+    assert_eq!(
+        parse_idle_ttl(Some(&MAX_TIMER_DELAY_SECONDS.to_string())).expect("maximum"),
+        Duration::from_secs(MAX_TIMER_DELAY_SECONDS)
+    );
+}
+
+#[test]
+fn idle_deadline_rejects_values_outside_the_timer_range() {
+    for value in [
+        "-1",
+        "1.5",
+        "forever",
+        "+5",
+        "9 0",
+        "1e3",
+        "2147484",
+        "99999999999999999999999",
+    ] {
+        let message = parse_idle_ttl(Some(value))
+            .expect_err("rejected")
+            .to_string();
+        assert!(
+            message.contains(&MAX_TIMER_DELAY_SECONDS.to_string()),
+            "{value}: {message}"
+        );
+        assert!(
+            message.contains("0 disables idle watcher eviction"),
+            "{value}: {message}"
+        );
+    }
+}
+
+#[test]
+fn idle_deadline_reads_the_environment_without_presetting_it() {
+    match std::env::var(WATCHER_IDLE_TIMEOUT_SECONDS_ENV) {
+        Ok(value) => assert_eq!(
+            configured_idle_ttl().expect("configured deadline"),
+            parse_idle_ttl(Some(&value)).expect("configured deadline")
+        ),
+        Err(_) => assert_eq!(
+            configured_idle_ttl().expect("default deadline"),
+            Duration::from_hours(4)
+        ),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_idle_deadline_disables_retirement_and_maintenance() {
+    let workspace = tempdir().expect("workspace");
+    let root = workspace.path().canonicalize().expect("root");
+    let (manager, watchers, _sender) = idle_fixture_with_ttl(Duration::ZERO);
+    let options = IndexOptions {
+        root: Some(root.clone()),
+        ..IndexOptions::default()
+    };
+    manager
+        .submit_index(options.clone(), true)
+        .await
+        .expect("index");
+    drain_runtime_callbacks().await;
+    drop(manager.runtime(root.clone(), &options).expect("runtime"));
+    assert!(
+        manager
+            .inner
+            .maintenance
+            .lock()
+            .expect("maintenance")
+            .is_none(),
+        "a disabled deadline schedules no maintenance"
+    );
+    tokio::time::advance(Duration::from_hours(8)).await;
+    manager.retire_idle(tokio::time::Instant::now()).await;
+    assert_eq!(manager.snapshot().active_runtimes, 1);
+    assert_eq!(watchers.closes.load(Ordering::Acquire), 0);
+    assert!(manager.job_for_root(&root).is_some());
+    manager.shutdown_all().await.expect("shutdown");
+}
+
+#[tokio::test(start_paused = true)]
+async fn configured_idle_deadline_replaces_the_default() {
+    let workspace = tempdir().expect("workspace");
+    let root = workspace.path().canonicalize().expect("root");
+    let (manager, _watchers, _sender) = idle_fixture_with_ttl(Duration::from_secs(90));
+    let options = IndexOptions {
+        root: Some(root.clone()),
+        ..IndexOptions::default()
+    };
+    manager
+        .submit_index(options.clone(), true)
+        .await
+        .expect("index");
+    drain_runtime_callbacks().await;
+    drop(manager.runtime(root.clone(), &options).expect("runtime"));
+    tokio::time::advance(Duration::from_secs(89)).await;
+    manager.retire_idle(tokio::time::Instant::now()).await;
+    assert_eq!(manager.snapshot().active_runtimes, 1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    manager.retire_idle(tokio::time::Instant::now()).await;
+    assert_eq!(manager.snapshot().active_runtimes, 0);
+    manager.shutdown_all().await.expect("shutdown");
 }

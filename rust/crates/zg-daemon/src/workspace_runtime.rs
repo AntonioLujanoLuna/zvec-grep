@@ -37,6 +37,7 @@ use crate::job_scheduler::{
     SchedulerConfig, SchedulerError, SchedulerSnapshot,
 };
 mod lifecycle;
+pub(crate) use lifecycle::configured_idle_ttl;
 use lifecycle::{RuntimeActivity, RuntimeLifecycle};
 use zg_transport_mcp::{
     IndexOperationError, IndexOperationProvider, IndexOperationResult, IndexOperationState,
@@ -230,20 +231,37 @@ impl WorkspaceWatcherFactoryPort for EngineWatcherFactory {
 }
 
 impl WorkspaceRuntimeManager {
-    pub(crate) fn native(engine: Arc<ZvecGrep>) -> Self {
-        Self::new(
+    pub(crate) fn native(engine: Arc<ZvecGrep>, idle_ttl: std::time::Duration) -> Self {
+        Self::new_with_idle_ttl(
             Arc::new(ZvecGrepIndexExecutor {
                 engine: Arc::clone(&engine),
             }),
             Arc::new(EngineWatcherFactory { engine }),
             SchedulerConfig::default(),
+            idle_ttl,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         executor: Arc<dyn IndexExecutor>,
         watcher_factory: Arc<dyn WorkspaceWatcherFactoryPort>,
         scheduler_config: SchedulerConfig,
+    ) -> Self {
+        Self::new_with_idle_ttl(
+            executor,
+            watcher_factory,
+            scheduler_config,
+            Self::DEFAULT_IDLE_TTL,
+        )
+    }
+
+    /// A zero `idle_ttl` disables idle retirement for this manager.
+    pub(crate) fn new_with_idle_ttl(
+        executor: Arc<dyn IndexExecutor>,
+        watcher_factory: Arc<dyn WorkspaceWatcherFactoryPort>,
+        scheduler_config: SchedulerConfig,
+        idle_ttl: std::time::Duration,
     ) -> Self {
         Self {
             inner: Arc::new(RuntimeManagerInner {
@@ -253,7 +271,7 @@ impl WorkspaceRuntimeManager {
                 runtimes: Mutex::new(HashMap::new()),
                 shutdown: CancellationToken::new(),
                 closed: AtomicBool::new(false),
-                idle_ttl: Self::DEFAULT_IDLE_TTL,
+                idle_ttl,
                 maintenance: Mutex::new(None),
             }),
         }
@@ -1477,7 +1495,10 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let root = workspace.path().canonicalize().expect("root");
         let engine = zg_engine::ZvecGrep::new();
-        let manager = WorkspaceRuntimeManager::native(Arc::new(zg_engine::ZvecGrep::new()));
+        let manager = WorkspaceRuntimeManager::native(
+            Arc::new(zg_engine::ZvecGrep::new()),
+            WorkspaceRuntimeManager::DEFAULT_IDLE_TTL,
+        );
         let options = InfoOptions {
             root: Some(root.clone()),
             include_status: true,
@@ -1615,7 +1636,10 @@ mod tests {
         let writer = std::fs::File::create(home.join("locks/home")).expect("writer lock");
         writer.lock().expect("exclusive workspace lock");
         let engine = Arc::new(ZvecGrep::new());
-        let manager = WorkspaceRuntimeManager::native(engine.clone());
+        let manager = WorkspaceRuntimeManager::native(
+            engine.clone(),
+            WorkspaceRuntimeManager::DEFAULT_IDLE_TTL,
+        );
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             manager.search(

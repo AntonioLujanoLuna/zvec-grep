@@ -139,6 +139,10 @@ pub enum DaemonError {
         report: Box<ErrorReport>,
         retryable: bool,
     },
+    #[error(
+        "ZVEC_GREP_WATCHER_IDLE_TIMEOUT_SECONDS must be an integer between 0 and {max_seconds}; 0 disables idle watcher eviction."
+    )]
+    InvalidWatcherIdleTimeout { max_seconds: u64 },
 }
 
 /// Resolves the daemon home without changing process-global state.

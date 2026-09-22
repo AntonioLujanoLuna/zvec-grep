@@ -318,7 +318,8 @@ async fn native_watcher_clean_refreshes_reuse_the_initial_reconciliation() {
     let workspace = tempdir().expect("workspace");
     let root = workspace.path().canonicalize().expect("root");
     let engine = Arc::new(zg_engine::ZvecGrep::new());
-    let manager = WorkspaceRuntimeManager::native(engine.clone());
+    let manager =
+        WorkspaceRuntimeManager::native(engine.clone(), WorkspaceRuntimeManager::DEFAULT_IDLE_TTL);
     let options = IndexOptions {
         root: Some(root.clone()),
         embedding: Some(EmbeddingModelSpec {

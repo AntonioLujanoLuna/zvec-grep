@@ -20,8 +20,10 @@ use zg_transport_mcp::{
 };
 
 use crate::{
-    DaemonError, ServerConfig, controller::InstanceLock, job_scheduler::JobState,
-    workspace_runtime::WorkspaceRuntimeManager,
+    DaemonError, ServerConfig,
+    controller::InstanceLock,
+    job_scheduler::JobState,
+    workspace_runtime::{WorkspaceRuntimeManager, configured_idle_ttl},
 };
 
 #[derive(Clone)]
@@ -60,6 +62,7 @@ pub(crate) async fn run_server(
     engine: Arc<ZvecGrep>,
 ) -> Result<(), DaemonError> {
     engine.enable_read_session_cache()?;
+    let idle_ttl = configured_idle_ttl()?;
     let token = crate::resolve_token(config.token_file.as_deref())?;
     let mut instance = InstanceLock::acquire(&config).await?;
     let listener = match tokio::net::TcpListener::bind(config.listen.socket_addr()).await {
@@ -70,7 +73,7 @@ pub(crate) async fn run_server(
         }
     };
     let shutdown = CancellationToken::new();
-    let runtimes = WorkspaceRuntimeManager::native(Arc::clone(&engine));
+    let runtimes = WorkspaceRuntimeManager::native(Arc::clone(&engine), idle_ttl);
     let status: Arc<dyn ServerStatusProvider> = Arc::new(RuntimeStatusProvider {
         started: Instant::now(),
         shutdown: shutdown.clone(),

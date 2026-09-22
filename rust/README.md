@@ -91,8 +91,10 @@ rebuild's unpublished generation remains private. The daemon preserves the refre
 policy when invoking the engine and also bounds cancellable waits for scheduled jobs.
 
 The daemon retires workspace runtimes and watchers after four hours without a
-foreground operation. Maintenance runs once per minute and does not renew the
-idle deadline. Active queries, inspections, watcher setup, queued indexing and
+foreground operation. `ZVEC_GREP_WATCHER_IDLE_TIMEOUT_SECONDS` overrides that
+deadline in whole seconds; `0` disables idle retirement and values above 2147483
+fail startup. Maintenance runs once per minute and does not renew the idle
+deadline. Active queries, inspections, watcher setup, queued indexing and
 running indexing prevent retirement; background changes and job completion do
 not restart the four-hour timer. Retirement forgets the workspace's finished job
 history and prevents old callbacks from restarting its watcher. A later request
